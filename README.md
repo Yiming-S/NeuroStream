@@ -78,8 +78,19 @@ Barachant et al. (2013). Top-performing family in MOABB motor imagery benchmarks
 - Python 3.9+
 - macOS with `tkinter` available
 
+### Run (recommended)
+
+```bash
+bash run.sh
+```
+
+`run.sh` automatically creates a virtual environment, installs all dependencies, and launches the app. Safe to run multiple times — it skips setup if the environment already exists.
+
+### Manual setup (alternative)
+
 ```bash
 pip install -r requirements.txt
+python main.py
 ```
 
 ### Dataset Layout
@@ -94,12 +105,6 @@ pip install -r requirements.txt
 ```
 
 If not present, MOABB can download it automatically on first run.
-
-### Run
-
-```bash
-python main.py
-```
 
 ### Typical Workflow
 

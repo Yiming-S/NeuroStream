@@ -5,3 +5,4 @@ mne>=1.6
 moabb>=1.1
 matplotlib>=3.7
 pyriemann>=0.7
+filelock>=3.12
