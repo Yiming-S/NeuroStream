@@ -323,11 +323,25 @@ class AppUI:
         add_slider(ep, "Start:", "t_min", -1.0, 2.0, self.config.t_min)
         add_slider(ep, "End:",   "t_max",  0.5, 8.0, self.config.t_max)
 
-        # Spatial Filters (CSP)
-        sp = section("Spatial Filters (CSP)")
-        hint(sp, "Extract discriminative spatial patterns for left/right imagery")
-        add_slider(sp, "Filters:", "csp_components", 2, 14,
+        # Spatial Filters — shown for CSP and FBCSP, hidden for TS
+        self._sp_frame = section("Spatial Filters")
+        add_slider(self._sp_frame, "Filters (n):", "csp_components", 2, 14,
                    self.config.csp_components, is_int=True)
+
+        # Bands row — only shown for FBCSP
+        self._bands_row = tk.Frame(self._sp_frame, bg=self.BG_COLOR)
+        tk.Label(self._bands_row, text="Freq. Bands:", width=12, anchor="w",
+                 font=("Helvetica Neue", 9),
+                 bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
+        self._fb_bands_var = tk.StringVar(value=self.config.fb_bands)
+        tk.Entry(self._bands_row, textvariable=self._fb_bands_var, width=22,
+                 font=("Helvetica Neue", 9),
+                 bg="#ffffff", fg=self.FG_COLOR,
+                 insertbackground=self.FG_COLOR,
+                 relief=tk.FLAT, bd=3).pack(side=tk.LEFT)
+        tk.Label(self._bands_row, text=" Hz  (fmin-fmax, …)",
+                 font=("Helvetica Neue", 8),
+                 bg=self.BG_COLOR, fg="#57606a").pack(side=tk.LEFT)
 
         # Training Setup
         tr = section("Training Setup", color="#1a7f37")
@@ -335,7 +349,7 @@ class AppUI:
         def add_entry_row(parent, label, key, default):
             row = tk.Frame(parent, bg=self.BG_COLOR)
             row.pack(fill=tk.X, padx=6, pady=2)
-            tk.Label(row, text=label, width=14, anchor="w",
+            tk.Label(row, text=label, width=16, anchor="w",
                      font=("Helvetica Neue", 9),
                      bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
             var = tk.StringVar(value=str(default))
@@ -350,15 +364,69 @@ class AppUI:
         add_entry_row(tr, "Train subjects:", "train_subjects", "1,2")
         add_entry_row(tr, "Test subject:",   "test_subject",   self.config.test_subject)
 
+        # ── Feature Extraction ──────────────────────────────────────────
+        feat_row = tk.Frame(tr, bg=self.BG_COLOR)
+        feat_row.pack(fill=tk.X, padx=6, pady=2)
+        tk.Label(feat_row, text="Feature Extraction:", width=16, anchor="w",
+                 font=("Helvetica Neue", 9),
+                 bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
+        self._feat_var = tk.StringVar(value="CSP")
+        feat_cb = ttk.Combobox(feat_row, textvariable=self._feat_var,
+                               values=["CSP", "FBCSP", "TS (Riemannian)"],
+                               width=14, state="readonly")
+        feat_cb.pack(side=tk.LEFT)
+
+        # Hint label that updates when feature extraction changes
+        self._feat_hint_lbl = tk.Label(tr, text="",
+                                       font=("Helvetica Neue", 8),
+                                       bg=self.BG_COLOR, fg="#57606a",
+                                       wraplength=230, justify="left")
+        self._feat_hint_lbl.pack(anchor="w", padx=8, pady=(0, 2))
+
+        # ── Classifier ──────────────────────────────────────────────────
         clf_row = tk.Frame(tr, bg=self.BG_COLOR)
         clf_row.pack(fill=tk.X, padx=6, pady=2)
-        tk.Label(clf_row, text="Classifier:", width=14, anchor="w",
+        tk.Label(clf_row, text="Classifier:", width=16, anchor="w",
                  font=("Helvetica Neue", 9),
                  bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
         self._clf_var = tk.StringVar(value=self.config.clf_type)
-        ttk.Combobox(clf_row, textvariable=self._clf_var,
-                     values=["LDA", "SVM"], width=8,
-                     state="readonly").pack(side=tk.LEFT)
+        self._clf_cb  = ttk.Combobox(clf_row, textvariable=self._clf_var,
+                                     values=["LDA", "SVM"],
+                                     width=8, state="readonly")
+        self._clf_cb.pack(side=tk.LEFT)
+
+        # Wire up the dynamic update
+        def _on_feat_change(*_):
+            feat = self._feat_var.get()
+            if feat == "CSP":
+                self._sp_frame.pack(fill=tk.X, padx=8, pady=(6, 0), before=tr)
+                self._bands_row.pack_forget()
+                self._clf_cb.config(values=["LDA", "SVM"])
+                if self._clf_var.get() == "MDM":
+                    self._clf_var.set("LDA")
+                self._feat_hint_lbl.config(
+                    text="Single bandpass → CSP spatial filters → LDA/SVM. "
+                         "Classic MOABB baseline (Jayaram & Barachant 2018).")
+            elif feat == "FBCSP":
+                self._sp_frame.pack(fill=tk.X, padx=8, pady=(6, 0), before=tr)
+                self._bands_row.pack(fill=tk.X, padx=6, pady=2)
+                self._clf_cb.config(values=["LDA", "SVM"])
+                if self._clf_var.get() == "MDM":
+                    self._clf_var.set("LDA")
+                self._feat_hint_lbl.config(
+                    text="FilterBankLeftRightImagery (moabb): CSP per band, "
+                         "features concatenated → LDA/SVM. Ang et al. 2012.")
+            else:  # TS (Riemannian)
+                self._sp_frame.pack_forget()
+                self._clf_cb.config(values=["LDA", "SVM", "MDM"])
+                self._feat_hint_lbl.config(
+                    text="pyriemann: covariances → Tangent Space (LDA/SVM) "
+                         "or Minimum Distance to Mean (MDM). "
+                         "Barachant et al. 2012/2013.")
+            self.root.after(50, lambda: inner.event_generate("<Configure>"))
+
+        feat_cb.bind("<<ComboboxSelected>>", _on_feat_change)
+        _on_feat_change()   # set initial state
 
         tk.Frame(inner, height=8, bg=self.BG_COLOR).pack()   # bottom padding
 
@@ -453,6 +521,26 @@ class AppUI:
             self.config.csp_components = round(self._sliders["csp_components"].get())
             self.config.test_subject   = int(self._entries["test_subject"].get())
             self.config.clf_type       = self._clf_var.get()
+            feat = self._feat_var.get()
+            clf  = self._clf_var.get()
+            if feat == "CSP":
+                self.config.pipeline_type = "CSP"
+            elif feat == "FBCSP":
+                self.config.pipeline_type = "FBCSP"
+                # Validate and store frequency bands string
+                raw_bands = self._fb_bands_var.get().strip()
+                for b in raw_bands.split(","):
+                    lo, hi = (float(x) for x in b.strip().split("-"))
+                    if lo >= hi:
+                        raise ValueError(f"Band {b.strip()}: fmin must be < fmax.")
+                self.config.fb_bands = raw_bands
+            else:  # TS (Riemannian)
+                if clf == "MDM":
+                    self.config.pipeline_type = "MDM"
+                elif clf == "SVM":
+                    self.config.pipeline_type = "TS+SVM"
+                else:
+                    self.config.pipeline_type = "TS+LDA"
             raw_subjects               = self._entries["train_subjects"].get()
             self.config.train_subjects = [int(s.strip()) for s in raw_subjects.split(",")]
         except ValueError as exc:
