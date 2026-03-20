@@ -346,23 +346,84 @@ class AppUI:
         # Training Setup
         tr = section("Training Setup", color="#1a7f37")
 
-        def add_entry_row(parent, label, key, default):
+        def add_entry_row(parent, label, key, default, width=8):
             row = tk.Frame(parent, bg=self.BG_COLOR)
             row.pack(fill=tk.X, padx=6, pady=2)
-            tk.Label(row, text=label, width=16, anchor="w",
+            tk.Label(row, text=label, width=18, anchor="w",
                      font=("Helvetica Neue", 9),
                      bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
             var = tk.StringVar(value=str(default))
-            tk.Entry(row, textvariable=var, width=8,
+            tk.Entry(row, textvariable=var, width=width,
                      font=("Helvetica Neue", 9),
                      bg="#ffffff", fg=self.FG_COLOR,
                      insertbackground=self.FG_COLOR,
                      relief=tk.FLAT, bd=3).pack(side=tk.LEFT)
             self._entries[key] = var
+            return row
 
-        hint(tr, "Train subjects: comma-separated IDs.  Test subject: single ID.")
-        add_entry_row(tr, "Train subjects:", "train_subjects", "1,2")
-        add_entry_row(tr, "Test subject:",   "test_subject",   self.config.test_subject)
+        # ── Evaluation Protocol selector ─────────────────────────────────
+        protocol_row = tk.Frame(tr, bg=self.BG_COLOR)
+        protocol_row.pack(fill=tk.X, padx=6, pady=(4, 2))
+        tk.Label(protocol_row, text="Evaluation Protocol:", width=18, anchor="w",
+                 font=("Helvetica Neue", 9, "bold"),
+                 bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
+        self._protocol_var = tk.StringVar(value=self.config.evaluation_protocol)
+        protocol_cb = ttk.Combobox(
+            protocol_row, textvariable=self._protocol_var,
+            values=["Cross-Subject", "Cross-Session"],
+            width=14, state="readonly",
+        )
+        protocol_cb.pack(side=tk.LEFT)
+
+        # Protocol description label
+        self._protocol_hint_lbl = tk.Label(
+            tr, text="", font=("Helvetica Neue", 8),
+            bg=self.BG_COLOR, fg="#57606a", wraplength=230, justify="left",
+        )
+        self._protocol_hint_lbl.pack(anchor="w", padx=8, pady=(0, 4))
+
+        # ── Cross-Subject parameter rows ─────────────────────────────────
+        self._cross_subject_rows = tk.Frame(tr, bg=self.BG_COLOR)
+        self._cross_subject_rows.pack(fill=tk.X)
+        add_entry_row(self._cross_subject_rows,
+                      "Train Subjects:",  "train_subjects",
+                      "1,2", width=8)
+        add_entry_row(self._cross_subject_rows,
+                      "Test Subject:",    "test_subject",
+                      self.config.test_subject, width=5)
+
+        # ── Cross-Session parameter rows ─────────────────────────────────
+        self._cross_session_rows = tk.Frame(tr, bg=self.BG_COLOR)
+        # (not packed initially — shown only when Cross-Session is selected)
+        add_entry_row(self._cross_session_rows,
+                      "Subject:",         "cross_session_subject",
+                      self.config.cross_session_subject, width=5)
+        add_entry_row(self._cross_session_rows,
+                      "Train Sessions:",  "train_sessions",
+                      "0,1", width=8)
+        add_entry_row(self._cross_session_rows,
+                      "Test Session:",    "test_session",
+                      self.config.test_session, width=5)
+
+        def _on_protocol_change(*_):
+            protocol = self._protocol_var.get()
+            if protocol == "Cross-Subject":
+                self._cross_session_rows.pack_forget()
+                self._cross_subject_rows.pack(fill=tk.X)
+                self._protocol_hint_lbl.config(
+                    text="Train on data from multiple subjects. "
+                         "Test on a different held-out subject.")
+            else:  # Cross-Session
+                self._cross_subject_rows.pack_forget()
+                self._cross_session_rows.pack(fill=tk.X)
+                self._protocol_hint_lbl.config(
+                    text="Train on earlier sessions of one subject. "
+                         "Test on a later session of the same subject. "
+                         "Zhou2016 has sessions 0, 1, 2.")
+            self.root.after(50, lambda: inner.event_generate("<Configure>"))
+
+        protocol_cb.bind("<<ComboboxSelected>>", _on_protocol_change)
+        _on_protocol_change()   # set initial state
 
         # ── Feature Extraction ──────────────────────────────────────────
         feat_row = tk.Frame(tr, bg=self.BG_COLOR)
@@ -519,7 +580,6 @@ class AppUI:
             self.config.t_min          = round(self._sliders["t_min"].get(), 1)
             self.config.t_max          = round(self._sliders["t_max"].get(), 1)
             self.config.csp_components = round(self._sliders["csp_components"].get())
-            self.config.test_subject   = int(self._entries["test_subject"].get())
             self.config.clf_type       = self._clf_var.get()
             feat = self._feat_var.get()
             clf  = self._clf_var.get()
@@ -541,8 +601,25 @@ class AppUI:
                     self.config.pipeline_type = "TS+SVM"
                 else:
                     self.config.pipeline_type = "TS+LDA"
-            raw_subjects               = self._entries["train_subjects"].get()
-            self.config.train_subjects = [int(s.strip()) for s in raw_subjects.split(",")]
+            # Evaluation protocol and its specific parameters
+            self.config.evaluation_protocol = self._protocol_var.get()
+
+            if self.config.evaluation_protocol == "Cross-Subject":
+                raw_subjects = self._entries["train_subjects"].get()
+                self.config.train_subjects = [
+                    int(s.strip()) for s in raw_subjects.split(",")
+                ]
+                self.config.test_subject = int(self._entries["test_subject"].get())
+            else:  # Cross-Session
+                self.config.cross_session_subject = int(
+                    self._entries["cross_session_subject"].get()
+                )
+                raw_sessions = self._entries["train_sessions"].get()
+                self.config.train_sessions = [
+                    int(s.strip()) for s in raw_sessions.split(",")
+                ]
+                self.config.test_session = int(self._entries["test_session"].get())
+
         except ValueError as exc:
             messagebox.showerror("Parameter Error", f"Invalid parameter value:\n{exc}")
             return False
@@ -556,6 +633,16 @@ class AppUI:
         if self.config.csp_components < 2:
             messagebox.showerror("Parameter Error", "CSP components must be ≥ 2.")
             return False
+
+        if self.config.evaluation_protocol == "Cross-Session":
+            if self.config.test_session in self.config.train_sessions:
+                messagebox.showerror(
+                    "Parameter Error",
+                    f"Test Session ({self.config.test_session}) must not overlap "
+                    "with Train Sessions.",
+                )
+                return False
+
         return True
 
     # ══════════════════════════════════════════════════════════════════
