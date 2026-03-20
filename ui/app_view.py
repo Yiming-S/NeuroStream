@@ -622,6 +622,11 @@ class AppUI:
         self.lbl_actual.config(text="Actual:  —", fg="#8c959f")
         self.progress_bar["value"] = 0
 
+        # Clear all visualisation canvases so previous-trial results are not
+        # visible during the current trial's EEG collection window.
+        self._conf_canvas.delete("all")
+        self._bp_canvas.delete("all")
+
         total_ms = int((self.config.t_max - self.config.t_min) * 1000)
         self._run_countdown(epoch, true_label, elapsed_ms=0, total_ms=total_ms)
 
