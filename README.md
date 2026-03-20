@@ -1,59 +1,97 @@
 # NeuroStream
 
-<p align="center">
-  <img src="assets/neurostream-overview.svg" alt="NeuroStream desktop app overview" width="980">
-</p>
-
 **Real-time BCI motor imagery streaming demo for macOS.**
 
-NeuroStream is a desktop app that trains a cross-subject EEG motor imagery classifier on the [Zhou2016](https://doi.org/10.1371/journal.pone.0162657) dataset through [MOABB](https://moabb.neurotechx.com), then replays a held-out subject as a pseudo-online stream. The UI shows prediction confidence, band-power summaries, trial history, and a live confusion matrix in one window.
+NeuroStream trains a cross-subject EEG motor imagery classifier on the [Zhou2016](https://doi.org/10.1371/journal.pone.0162657) dataset via [MOABB](https://moabb.neurotechx.com), then replays a held-out subject as a pseudo-online stream. All feature extraction and classification pipelines are directly sourced from MOABB and pyriemann.
 
 ## Highlights
 
-- Cross-subject pipeline: Euclidean Alignment (EA) plus CSP plus `LDA` or `SVM`
-- Desktop UI built with `tkinter`, background training thread, and `root.after()` driven streaming
-- Uses an existing local `MNE-zhou-2016/` folder when available; no forced redownload
-- All core parameters are exposed in the UI and stored in `BCIConfig`
+- **Five selectable pipelines** via MOABB / pyriemann: CSP, FBCSP, TS+LDA, TS+SVM, MDM
+- **Euclidean Alignment (EA)** for cross-subject covariance shift reduction (CSP and FBCSP)
+- **Riemannian geometry** (pyriemann): covariance estimation → Tangent Space or MDM
+- Desktop UI built with `tkinter`, background training thread, `root.after()` driven streaming
+- Uses an existing local `MNE-zhou-2016/` folder when available — no forced redownload
+- All parameters exposed in the UI and stored in `BCIConfig`
 
 ## What The App Shows
 
 | Area | Purpose |
-|---|---|
+| --- | --- |
 | Data Folder | Point the app at a local Zhou2016 download |
-| Parameters | Tune filter range, epoch window, CSP filters, classifier, and subject split |
-| Train and Load | Build the model without freezing the GUI |
-| Live Feed | Watch the pseudo-online trial countdown and prediction state |
-| Confidence | Compare LEFT vs RIGHT probabilities |
-| Band Power | Inspect relative mu and beta power for the current trial |
-| Trial History | Track recent hits and misses plus cumulative accuracy |
-| Confusion Matrix | See running class-level performance |
+| Feature Extraction | Choose CSP / FBCSP / TS (Riemannian) |
+| Classifier | Choose LDA / SVM / MDM (MDM for TS only) |
+| Spatial Filters | Set CSP filter count; set custom frequency bands for FBCSP |
+| Train & Load | Build and fit the model without freezing the GUI |
+| Live Feed | Pseudo-online trial countdown and prediction state |
+| Confidence Bar | LEFT vs RIGHT class probability |
+| Band Power | Relative mu and beta power for the current trial |
+| Trial History | Recent hits / misses and cumulative accuracy line |
+| Confusion Matrix | Running class-level performance (LEFT vs RIGHT) |
 
-## Signal Processing Pipeline
+## Pipelines
+
+All pipelines are implemented using MOABB and pyriemann building blocks.
+
+### CSP
 
 ```text
 Raw EEG
-  -> Bandpass Filter (8-30 Hz)
-  -> Epoch (0-3 s post-cue)
-  -> Euclidean Alignment
-  -> CSP (log-variance features)
+  -> Bandpass filter (configurable, default 8–30 Hz)
+  -> Euclidean Alignment (He & Wu 2020)
+  -> mne.decoding.CSP  (log-variance features)
   -> LDA or linear SVM
-  -> LEFT / RIGHT prediction
 ```
+
+Classic MOABB baseline — Jayaram & Barachant (2018).
+
+### FBCSP
+
+```text
+Raw EEG
+  -> moabb.paradigms.FilterBankLeftRightImagery
+     (configurable bands, default: 8–12, 12–16, 16–20, 20–24, 24–28, 28–32 Hz)
+  -> Euclidean Alignment per band
+  -> moabb.pipelines.utils.FilterBank(CSP)  — CSP applied per band, features concatenated
+  -> LDA or linear SVM
+```
+
+Ang et al. (2012).
+
+### TS+LDA / TS+SVM
+
+```text
+Raw EEG
+  -> Bandpass filter
+  -> pyriemann.estimation.Covariances (OAS estimator)
+  -> pyriemann.tangentspace.TangentSpace (Riemannian metric)
+  -> LDA or linear SVM
+```
+
+Barachant et al. (2013). Top-performing family in MOABB motor imagery benchmarks.
+
+### MDM
+
+```text
+Raw EEG
+  -> Bandpass filter
+  -> pyriemann.estimation.Covariances (OAS estimator)
+  -> pyriemann.classification.MDM (Riemannian distance to class mean)
+```
+
+Barachant et al. (2012). Zero hyperparameters; strong cross-subject generalisation.
 
 ## Quick Start
 
 ### Requirements
 
 - Python 3.9+
-- macOS with `tkinter` available in the Python installation
-
-Install dependencies:
+- macOS with `tkinter` available
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Expected Dataset Layout
+### Dataset Layout
 
 ```text
 /your/data/path/
@@ -64,7 +102,7 @@ pip install -r requirements.txt
     └── sub-4/
 ```
 
-If the dataset is not already present, the app can offer a MOABB download for Zhou2016.
+If not present, MOABB can download it automatically on first run.
 
 ### Run
 
@@ -74,49 +112,50 @@ python main.py
 
 ### Typical Workflow
 
-1. Paste or browse to the folder that contains `MNE-zhou-2016/`.
-2. Adjust the parameters in the left panel if needed.
-3. Click `Train & Load`.
-4. Click `Start Stream` to replay the held-out subject trial by trial.
-5. Use `Pause` or `Stop` while inspecting the live metrics.
+1. Paste or browse to the folder containing `MNE-zhou-2016/`.
+2. Select **Feature Extraction** method and **Classifier**.
+3. Adjust Bandpass / Epoch Window / Spatial Filters as needed.
+4. Click **Train & Load**.
+5. Click **Start Stream** to replay the held-out subject trial by trial.
+6. Use **Pause** / **Stop** while inspecting live metrics.
 
 ## Project Structure
 
 ```text
-main.py            # App entry point
-config.py          # Central parameter dataclass
-data_engine.py     # MOABB loading and Euclidean Alignment
-model.py           # CSP + LDA/SVM pipeline
-streaming.py       # Trial streaming simulator
-ui/app_view.py     # Tkinter layout and app state
-ui/plots.py        # Custom canvas charts
+APP/
+├── main.py            Entry point (window init + mainloop)
+├── config.py          BCIConfig dataclass — all tunable parameters
+├── data_engine.py     MOABB data loading, paradigm selection, EA alignment
+├── model.py           Pipeline factory (CSP / FBCSP / TS / MDM)
+├── streaming.py       Trial-by-trial streaming simulator
+├── ui/
+│   ├── app_view.py    Tkinter layout, state machine, training/streaming control
+│   └── plots.py       Canvas drawing functions (confidence, band power, confusion matrix, chart)
+└── requirements.txt
 ```
 
 ## Default Parameters
 
 | Parameter | Default |
-|---|---|
-| Bandpass Low | `8.0 Hz` |
-| Bandpass High | `30.0 Hz` |
-| Epoch Start | `0.0 s` |
-| Epoch End | `3.0 s` |
-| CSP Filters | `8` |
+| --- | --- |
+| Feature Extraction | `CSP` |
 | Classifier | `LDA` |
+| Bandpass | `8.0 – 30.0 Hz` |
+| Epoch Window | `0.0 – 3.0 s` |
+| CSP Filters | `8` |
+| FBCSP Bands | `8-12, 12-16, 16-20, 20-24, 24-28, 28-32 Hz` |
 | Train Subjects | `1, 2` |
 | Test Subject | `3` |
 
-## Dataset
+## References
 
-**Zhou2016** is a public EEG motor imagery dataset exposed in MOABB as `moabb.datasets.Zhou2016`.
-
-Reference:
-
-- Zhou, B., Wu, X., Lv, Z., Zhang, L., and Guo, X. (2016). *A Fully Automated Trial Selection Method for Optimization of Motor Imagery Based Brain-Computer Interface.* PLOS ONE.
-
-## Key References
-
-- He, H., and Wu, D. (2020). Transfer learning for brain-computer interfaces: A Euclidean space data alignment approach.
-- Blankertz, B., Tomioka, R., Lemm, S., Kawanabe, M., and Muller, K. R. (2008). Optimizing spatial filters for robust EEG single-trial analysis.
+- **Zhou2016 dataset**: Zhou et al. (2016). *A Fully Automated Trial Selection Method for Optimization of Motor Imagery Based BCI.* PLOS ONE.
+- **MOABB**: Jayaram & Barachant (2018). *MOABB: trustworthy algorithm benchmarking for BCIs.* J. Neural Eng.
+- **Euclidean Alignment**: He & Wu (2020). *Transfer learning for BCIs: A Euclidean space data alignment approach.* IEEE Trans. Biomed. Eng.
+- **FBCSP**: Ang et al. (2012). *Filter bank common spatial pattern algorithm on BCI competition IV.* Front. Hum. Neurosci.
+- **Riemannian geometry / MDM**: Barachant et al. (2012). *Multiclass brain-computer interface classification by Riemannian geometry.* IEEE Trans. Biomed. Eng.
+- **Tangent Space**: Barachant et al. (2013). *Classification of covariance matrices using a Riemannian-based kernel.* Signal Processing.
+- **CSP**: Blankertz et al. (2008). *Optimizing spatial filters for robust EEG single-trial analysis.* IEEE Signal Process. Mag.
 
 ## License
 
