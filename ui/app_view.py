@@ -8,9 +8,9 @@ results back via root.after(0, callback).
 Streaming is driven entirely by root.after() — no time.sleep(), no threads.
 """
 
-import os
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
@@ -26,6 +26,8 @@ from .plots import (
     draw_confusion_matrix,
     draw_trial_chart,
 )
+
+_LOGO_PATH = Path(__file__).resolve().parent / "img" / "neurostream.png"
 
 
 class AppUI:
@@ -69,7 +71,7 @@ class AppUI:
     # ------------------------------------------------------------------
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("BCI Streaming Demo — Motor Imagery")
+        self.root.title("NeuroStream — Motor Imagery Demo")
         self.root.configure(bg=self.BG_COLOR)
         self.root.resizable(True, True)
 
@@ -99,31 +101,39 @@ class AppUI:
     # ══════════════════════════════════════════════════════════════════
 
     def _build_ui(self) -> None:
+        header_frame = tk.Frame(self.root, bg=self.BG_COLOR)
+        header_frame.pack(fill=tk.X, padx=20, pady=(14, 10))
+        header_frame.grid_columnconfigure(0, weight=1)
+        header_frame.grid_columnconfigure(1, weight=0)
+        header_frame.grid_columnconfigure(2, weight=1)
+
+        title_block = tk.Frame(header_frame, bg=self.BG_COLOR)
+        title_block.grid(row=0, column=1, sticky="n")
+
         # App icon / logo
-        icon_path = os.path.join(os.path.dirname(__file__), "img", "neurostream_app.jpeg")
         try:
             from PIL import Image, ImageTk
-            _img = Image.open(icon_path).resize((64, 64), Image.LANCZOS)
+            _img = Image.open(_LOGO_PATH).resize((84, 84), Image.LANCZOS)
             self._logo_img = ImageTk.PhotoImage(_img)
             tk.Label(
-                self.root, image=self._logo_img, bg=self.BG_COLOR,
-            ).pack(pady=(14, 0))
+                header_frame, image=self._logo_img, bg=self.BG_COLOR,
+            ).grid(row=0, column=0, rowspan=2, sticky="w", padx=(44, 18))
         except Exception:
             pass  # skip logo if Pillow is unavailable
 
         tk.Label(
-            self.root,
+            title_block,
             text="BCI  Real-Time Motor Imagery Demo",
             font=("Helvetica Neue", 20, "bold"),
             bg=self.BG_COLOR, fg=self.FG_COLOR,
-        ).pack(pady=(8, 2))
+        ).pack()
 
         tk.Label(
-            self.root,
+            title_block,
             text="Zhou2016  ·  Cross-Subject Classification  ·  CSP + LDA / SVM",
             font=("Helvetica Neue", 10),
             bg=self.BG_COLOR, fg="#57606a",
-        ).pack(pady=(0, 10))
+        ).pack(pady=(6, 0))
 
         tk.Frame(self.root, height=1, bg="#d0d7de").pack(fill=tk.X, padx=20)
 

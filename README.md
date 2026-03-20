@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ui/img/neurostream_app.jpeg" alt="NeuroStream Logo" width="120">
+  <img src="ui/img/neurostream.svg" alt="NeuroStream Logo" width="120">
 </p>
 
 <h1 align="center">NeuroStream</h1>

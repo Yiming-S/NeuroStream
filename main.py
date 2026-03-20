@@ -11,9 +11,40 @@ Entry point only.  All logic lives in the sub-modules:
     ui/app_view.py     tkinter AppUI (root.after driven, never blocks)
 """
 
+import sys
 import tkinter as tk
+from pathlib import Path
 
 from ui.app_view import AppUI
+
+_BASE_DIR = Path(__file__).resolve().parent
+_ICON_PATH = _BASE_DIR / "ui" / "img" / "neurostream.png"
+
+
+def _set_macos_dock_icon() -> None:
+    """Update the macOS Dock icon from the bundled PNG asset."""
+    if sys.platform != "darwin":
+        return
+    try:
+        from AppKit import NSApplication, NSImage  # type: ignore[import]
+        ns_app = NSApplication.sharedApplication()
+        ns_icon = NSImage.alloc().initWithContentsOfFile_(str(_ICON_PATH))
+        if ns_icon:
+            ns_app.setApplicationIconImage_(ns_icon)
+    except Exception:
+        pass
+
+
+def _set_window_icon(root: tk.Tk) -> None:
+    """Set the runtime window/taskbar icon for Tk-managed windows."""
+    try:
+        from PIL import Image, ImageTk
+        img = Image.open(str(_ICON_PATH))
+        icon = ImageTk.PhotoImage(img)
+        root._app_icon = icon  # keep a reference alive for Tk
+        root.iconphoto(True, icon)
+    except Exception:
+        pass
 
 
 def main() -> None:
@@ -21,6 +52,8 @@ def main() -> None:
     matplotlib.use("Agg")   # no MNE plot windows stealing focus
 
     root = tk.Tk()
+    _set_window_icon(root)
+    _set_macos_dock_icon()
     root.geometry("1050x720")
     root.minsize(860, 600)
 
