@@ -1,6 +1,6 @@
 # NeuroStream
 
-**Real-time BCI motor imagery streaming demo for macOS.**
+**Real-time BCI motor imagery streaming**
 
 ![NeuroStream overview](assets/neurostream-overview.svg)
 
