@@ -1,6 +1,10 @@
-# NeuroStream
+<p align="center">
+  <img src="ui/img/neurostream_app.jpeg" alt="NeuroStream Logo" width="120">
+</p>
 
-**Real-time BCI motor imagery streaming**
+<h1 align="center">NeuroStream</h1>
+
+<p align="center"><strong>Real-time BCI motor imagery streaming</strong></p>
 
 ![NeuroStream overview](assets/neurostream-overview.svg)
 

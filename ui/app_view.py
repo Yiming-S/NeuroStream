@@ -8,6 +8,7 @@ results back via root.after(0, callback).
 Streaming is driven entirely by root.after() — no time.sleep(), no threads.
 """
 
+import os
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -98,12 +99,24 @@ class AppUI:
     # ══════════════════════════════════════════════════════════════════
 
     def _build_ui(self) -> None:
+        # App icon / logo
+        icon_path = os.path.join(os.path.dirname(__file__), "img", "neurostream_app.jpeg")
+        try:
+            from PIL import Image, ImageTk
+            _img = Image.open(icon_path).resize((64, 64), Image.LANCZOS)
+            self._logo_img = ImageTk.PhotoImage(_img)
+            tk.Label(
+                self.root, image=self._logo_img, bg=self.BG_COLOR,
+            ).pack(pady=(14, 0))
+        except Exception:
+            pass  # skip logo if Pillow is unavailable
+
         tk.Label(
             self.root,
             text="BCI  Real-Time Motor Imagery Demo",
             font=("Helvetica Neue", 20, "bold"),
             bg=self.BG_COLOR, fg=self.FG_COLOR,
-        ).pack(pady=(18, 2))
+        ).pack(pady=(8, 2))
 
         tk.Label(
             self.root,
