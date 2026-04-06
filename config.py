@@ -21,6 +21,13 @@ class BCIConfig:
     t_min: float = 0.0
     t_max: float = 3.0
 
+    # ── Progressive prediction ────────────────────────────────────────
+
+    # When enabled, the model predicts at increasing sub-windows
+    # during EEG collection and refreshes the UI in real time.
+    progressive: bool = True
+    prog_step: float = 0.5
+
     # ── Feature extraction ─────────────────────────────────────────────
 
     # Number of spatial filters retained per class (CSP / FBCSP only)

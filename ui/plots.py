@@ -53,6 +53,8 @@ def draw_confidence(
 
 def band_power(epoch: np.ndarray, sfreq: float, fmin: float, fmax: float) -> float:
     """Band power as fraction of total spectral power (0–1)."""
+    if epoch.ndim == 3:
+        return 0.0
     n_times = epoch.shape[1]
     freqs   = np.fft.rfftfreq(n_times, 1.0 / sfreq)
     ps      = np.abs(np.fft.rfft(epoch, axis=1)) ** 2   # (channels, freqs)
@@ -80,6 +82,15 @@ def draw_band_power(
 
     mu_frac   = band_power(epoch, sfreq, 8,  12)
     beta_frac = band_power(epoch, sfreq, 13, 30)
+    if epoch.ndim == 3 and mu_frac == 0.0 and beta_frac == 0.0:
+        c.create_text(
+            W // 2, H // 2,
+            text="N/A (Filter Bank)",
+            fill="#57606a",
+            font=("Helvetica Neue", 9, "bold"),
+            anchor="center",
+        )
+        return
     bands = [
         ("μ  8–12 Hz",  mu_frac,   accent),
         ("β  13–30 Hz", beta_frac, green),

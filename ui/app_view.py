@@ -93,6 +93,8 @@ class AppUI:
         # Visualisation state
         self._sfreq:      float = 250.0
         self._conf_matrix: list = [[0, 0], [0, 0]]
+        self._prog_sample_points: list[int] = []
+        self._prog_time_labels: list[float] = []
 
         self._build_ui()
 
@@ -345,6 +347,69 @@ class AppUI:
         hint(ep, "EEG segment per trial, relative to stimulus onset (seconds)")
         add_slider(ep, "Start:", "t_min", -1.0, 2.0, self.config.t_min)
         add_slider(ep, "End:",   "t_max",  0.5, 8.0, self.config.t_max)
+
+        # Progressive Prediction
+        pg = section("Progressive Prediction", color="#7d4e00")
+        hint(pg, "Refresh tentative predictions during EEG collection at sub-windows.")
+
+        prog_toggle_row = tk.Frame(pg, bg=self.BG_COLOR)
+        prog_toggle_row.pack(fill=tk.X, padx=6, pady=(2, 0))
+        self._prog_var = tk.BooleanVar(value=self.config.progressive)
+        tk.Checkbutton(
+            prog_toggle_row,
+            text="Enable",
+            variable=self._prog_var,
+            font=("Helvetica Neue", 9),
+            bg=self.BG_COLOR,
+            fg=self.FG_COLOR,
+            activebackground=self.BG_COLOR,
+            activeforeground=self.FG_COLOR,
+            selectcolor="#ffffff",
+            highlightthickness=0,
+            anchor="w",
+        ).pack(side=tk.LEFT)
+
+        prog_step_row = tk.Frame(pg, bg=self.BG_COLOR)
+        prog_step_row.pack(fill=tk.X, padx=6, pady=2)
+        tk.Label(
+            prog_step_row, text="Step:", width=9, anchor="w",
+            font=("Helvetica Neue", 9),
+            bg=self.BG_COLOR, fg=self.FG_COLOR,
+        ).pack(side=tk.LEFT)
+        prog_step_var = tk.DoubleVar(value=self.config.prog_step)
+        self._sliders["prog_step"] = prog_step_var
+        self._prog_step_value_lbl = tk.Label(
+            prog_step_row, text=f"{self.config.prog_step:.2f} s",
+            width=7, anchor="e",
+            font=("Helvetica Neue", 9, "bold"),
+            bg=self.BG_COLOR, fg=self.ACCENT,
+        )
+
+        def _on_prog_step_slide(v):
+            self._prog_step_value_lbl.config(text=f"{float(v):.2f} s")
+
+        self._prog_step_scale = ttk.Scale(
+            prog_step_row,
+            from_=0.25,
+            to=1.0,
+            variable=prog_step_var,
+            orient=tk.HORIZONTAL,
+            command=_on_prog_step_slide,
+        )
+        self._prog_step_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._prog_step_value_lbl.pack(side=tk.RIGHT, padx=(4, 0))
+
+        def _sync_progressive_controls(*_):
+            enabled = self._prog_var.get()
+            if enabled:
+                self._prog_step_scale.state(["!disabled"])
+                self._prog_step_value_lbl.config(fg=self.ACCENT)
+            else:
+                self._prog_step_scale.state(["disabled"])
+                self._prog_step_value_lbl.config(fg=self._BTN_FG_OFF)
+
+        self._prog_var.trace_add("write", _sync_progressive_controls)
+        _sync_progressive_controls()
 
         # Spatial Filters — shown for CSP and FBCSP, hidden for TS
         self._sp_frame = section("Spatial Filters")
@@ -602,6 +667,8 @@ class AppUI:
             self.config.f_high         = round(self._sliders["f_high"].get(), 1)
             self.config.t_min          = round(self._sliders["t_min"].get(), 1)
             self.config.t_max          = round(self._sliders["t_max"].get(), 1)
+            self.config.progressive    = self._prog_var.get()
+            self.config.prog_step      = round(self._sliders["prog_step"].get(), 2)
             self.config.csp_components = round(self._sliders["csp_components"].get())
             self.config.clf_type       = self._clf_var.get()
             feat = self._feat_var.get()
@@ -656,6 +723,30 @@ class AppUI:
         if self.config.csp_components < 2:
             messagebox.showerror("Parameter Error", "CSP components must be ≥ 2.")
             return False
+        if self.config.progressive and self.config.prog_step < 0.25:
+            messagebox.showerror(
+                "Parameter Error",
+                "Progressive step must be at least 0.25 seconds.",
+            )
+            return False
+
+        duration = self.config.t_max - self.config.t_min
+        if self.config.progressive and self.config.prog_step > duration:
+            messagebox.showerror(
+                "Parameter Error",
+                "Progressive step must be ≤ epoch duration.",
+            )
+            return False
+
+        if self.config.progressive and self.config.pipeline_type in {"CSP", "FBCSP"}:
+            estimated_sfreq = 250.0  # Zhou2016 sampling rate
+            min_samples = int(round(self.config.prog_step * estimated_sfreq))
+            if min_samples < self.config.csp_components:
+                messagebox.showerror(
+                    "Parameter Error",
+                    "Progressive step is too short for the current CSP component count.",
+                )
+                return False
 
         if self.config.evaluation_protocol == "Cross-Session":
             if self.config.test_session in self.config.train_sessions:
@@ -754,13 +845,46 @@ class AppUI:
     # Training Thread
     # ══════════════════════════════════════════════════════════════════
 
+    def _compute_time_points(self) -> list[float]:
+        """Return sub-window checkpoints in seconds, always including full duration."""
+        duration = self.config.t_max - self.config.t_min
+        step = self.config.prog_step
+        points: list[float] = []
+        t = step
+        while t < duration - 1e-9:
+            points.append(round(t, 3))
+            t += step
+        points.append(round(duration, 3))
+        return points
+
     def _train_worker(self) -> None:
         try:
             self.data_engine = DataEngine(self.config)
             X_train, y_train = self.data_engine.get_train_data()
 
+            duration = self.config.t_max - self.config.t_min
+            sfreq_train = X_train.shape[2] / duration
             self.model = BCIModel(self.config)
-            self.model.build()
+
+            if self.config.progressive:
+                time_points = self._compute_time_points()
+                full_ns = X_train.shape[2]
+                sample_points = sorted({
+                    max(1, min(full_ns, int(round(t * sfreq_train))))
+                    for t in time_points
+                })
+                if sample_points[-1] != full_ns:
+                    sample_points.append(full_ns)
+                self.model.build(sample_points=sample_points)
+                self._prog_sample_points = sample_points
+                self._prog_time_labels = [
+                    round(ns / sfreq_train, 3) for ns in sample_points
+                ]
+            else:
+                self.model.build()
+                self._prog_sample_points = []
+                self._prog_time_labels = []
+
             train_acc = self.model.train(X_train, y_train)
 
             X_test, y_test, sfreq = self.data_engine.get_test_data()
@@ -826,10 +950,17 @@ class AppUI:
         self._bp_canvas.delete("all")
 
         total_ms = int((self.config.t_max - self.config.t_min) * 1000)
-        self._run_countdown(epoch, true_label, elapsed_ms=0, total_ms=total_ms)
+        self._run_countdown(
+            epoch, true_label, elapsed_ms=0, total_ms=total_ms, next_prog_idx=0
+        )
 
     def _run_countdown(
-        self, epoch: np.ndarray, true_label: int, elapsed_ms: int, total_ms: int
+        self,
+        epoch: np.ndarray,
+        true_label: int,
+        elapsed_ms: int,
+        total_ms: int,
+        next_prog_idx: int = 0,
     ) -> None:
         if not self._running or self._paused:
             return
@@ -843,18 +974,63 @@ class AppUI:
         )
         self.progress_bar["value"] = pct
 
+        if self.config.progressive and self._prog_sample_points:
+            n_prog = len(self._prog_sample_points) - 1
+            while (
+                next_prog_idx < n_prog
+                and elapsed_ms >= self._prog_time_labels[next_prog_idx] * 1000 - 1e-3
+            ):
+                ns = self._prog_sample_points[next_prog_idx]
+                pred_label, proba = self.model.predict_at(epoch, ns)
+                self._update_progressive_ui(
+                    epoch, pred_label, proba, ns, self._prog_time_labels[next_prog_idx]
+                )
+                next_prog_idx += 1
+
         if elapsed_ms >= total_ms:
             self.lbl_status.config(text="Status:  Processing …", fg=self.YELLOW)
             self.root.after(80, lambda: self._do_predict(epoch, true_label))
         else:
             self.root.after(
                 self._COUNTDOWN_TICK_MS,
-                lambda: self._run_countdown(
+                lambda idx=next_prog_idx: self._run_countdown(
                     epoch, true_label,
                     elapsed_ms + self._COUNTDOWN_TICK_MS,
                     total_ms,
+                    idx,
                 ),
             )
+
+    def _update_progressive_ui(
+        self,
+        epoch: np.ndarray,
+        pred_label: int,
+        proba: np.ndarray,
+        n_samples: int,
+        t_label: float,
+    ) -> None:
+        """Refresh tentative prediction widgets without updating final metrics."""
+        pred_name = StreamingSimulator.label_name(pred_label)
+        total_s = self.config.t_max - self.config.t_min
+
+        self.lbl_prediction.config(
+            text=f"Prediction:  {pred_name}  (tentative, {t_label:.1f}s)",
+            fg="#6e7781",
+        )
+        self.lbl_status.config(
+            text=f"Status:  Predicting  ({t_label:.1f}s / {total_s:.1f}s)",
+            fg=self.YELLOW,
+        )
+
+        draw_confidence(self._conf_canvas, proba, self.ACCENT, self.FG_COLOR)
+        if epoch.ndim == 2:
+            sub_epoch = epoch[:, :n_samples]
+        else:
+            sub_epoch = epoch[:, :n_samples, :]
+        draw_band_power(
+            self._bp_canvas, sub_epoch, self._sfreq,
+            self.ACCENT, self.GREEN, self.FG_COLOR,
+        )
 
     def _do_predict(self, epoch: np.ndarray, true_label: int) -> None:
         try:
