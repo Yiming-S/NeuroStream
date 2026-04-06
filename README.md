@@ -6,7 +6,7 @@
 
 <p align="center"><strong>Real-time BCI motor imagery decoding with progressive prediction</strong></p>
 
-![NeuroStream overview](assets/neurostream-overview.png)
+![NeuroStream overview](assets/neurostream-overview.gif)
 
 NeuroStream is a desktop application that trains cross-subject (or cross-session) EEG motor imagery classifiers on the [Zhou2016](https://doi.org/10.1371/journal.pone.0162657) dataset via [MOABB](https://moabb.neurotechx.com), then replays a held-out subject as a pseudo-online stream with **progressive prediction** — the model begins predicting as soon as 0.5 s of EEG is available and continuously refines its output as more data arrives within each trial.
 
