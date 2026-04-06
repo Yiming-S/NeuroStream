@@ -54,8 +54,8 @@ def main() -> None:
     root = tk.Tk()
     _set_window_icon(root)
     _set_macos_dock_icon()
-    root.geometry("1050x720")
-    root.minsize(860, 600)
+    root.geometry("1080x860")
+    root.minsize(900, 720)
 
     try:
         root.tk.call(

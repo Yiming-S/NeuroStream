@@ -599,15 +599,45 @@ class AppUI:
 
     # ------------------------------------------------------------------
     def _build_display_panel(self, parent: tk.Frame) -> None:
-        panel = tk.LabelFrame(
+        outer = tk.LabelFrame(
             parent,
             text=" Live Feed ",
             font=("Helvetica Neue", 11, "bold"),
             bg=self.BG_COLOR, fg=self.ACCENT,
             relief=tk.RIDGE, bd=2,
         )
-        panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=4)
-        self._display_panel = panel   # keep reference for overlay
+        outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=4)
+        self._display_panel = outer   # keep reference for overlay
+
+        # Scrollable interior
+        self._display_sb = ttk.Scrollbar(outer, orient="vertical")
+        disp_canvas = tk.Canvas(outer, bg=self.BG_COLOR, highlightthickness=0,
+                                yscrollcommand=self._display_sb.set)
+        self._display_sb.config(command=disp_canvas.yview)
+        disp_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        panel = tk.Frame(disp_canvas, bg=self.BG_COLOR)
+        win_id = disp_canvas.create_window((0, 0), window=panel, anchor="nw")
+
+        def _sync_display_scroll(e=None):
+            disp_canvas.configure(scrollregion=disp_canvas.bbox("all"))
+            if panel.winfo_reqheight() > disp_canvas.winfo_height():
+                self._display_sb.pack(side=tk.RIGHT, fill=tk.Y)
+            else:
+                self._display_sb.pack_forget()
+
+        def _fit_display_width(e):
+            disp_canvas.itemconfig(win_id, width=e.width)
+            _sync_display_scroll()
+
+        panel.bind("<Configure>", _sync_display_scroll)
+        disp_canvas.bind("<Configure>", _fit_display_width)
+        disp_canvas.bind("<MouseWheel>",
+                         lambda e: disp_canvas.yview_scroll(
+                             int(-1 * e.delta / 120), "units"))
+        panel.bind("<MouseWheel>",
+                   lambda e: disp_canvas.yview_scroll(
+                       int(-1 * e.delta / 120), "units"))
 
         # Phase indicator
         self._phase_indicator = PhaseIndicator(
@@ -685,9 +715,10 @@ class AppUI:
         self._cm_canvas.pack(fill=tk.X, padx=6, pady=6)
 
         # Welcome overlay — shown until first training completes
+        # Placed on outer LabelFrame so it covers the scroll area
         logo_img = getattr(self, "_logo_img", None)
         self._welcome = WelcomeOverlay(
-            panel, bg=self.BG_COLOR, fg=self.FG_COLOR,
+            outer, bg=self.BG_COLOR, fg=self.FG_COLOR,
             accent=self.ACCENT, logo_image=logo_img,
         )
         self._welcome.show()
@@ -868,8 +899,12 @@ class AppUI:
                 self.lbl_countdown.config(
                     fg=self.YELLOW, font=("Helvetica Neue", 20))
                 self.lbl_prediction.config(
-                    text="Prediction:  —", fg=self.ACCENT)
-                self.lbl_actual.config(text="Actual:  —", fg="#8c959f")
+                    text="Prediction:  —", fg=self.ACCENT,
+                    font=("Helvetica Neue", 26))
+                self.lbl_actual.config(
+                    text="Actual:  —", fg="#8c959f",
+                    font=("Helvetica Neue", 20))
+                self._conf_canvas.config(height=36)
                 self._conf_canvas.delete("all")
                 self._bp_canvas.delete("all")
             lbl.config(text="⏸   Pause")
@@ -1168,6 +1203,65 @@ class AppUI:
     # Summary View
     # ══════════════════════════════════════════════════════════════════
 
+    def _generate_conclusion(self, acc: float) -> tuple[str, str]:
+        """
+        Return (performance_line, progressive_line) for the summary view.
+        """
+        # ── Performance rating ──
+        if acc > 0.80:
+            perf = ("Excellent decoding performance — "
+                    "strong separability between classes.")
+        elif acc > 0.70:
+            perf = ("Good performance — "
+                    "reliable above chance with room for improvement.")
+        elif acc > 0.60:
+            perf = ("Moderate performance — "
+                    "above chance but noisy; consider tuning parameters.")
+        elif acc > 0.50:
+            perf = ("Weak performance — "
+                    "the model struggles to distinguish LEFT from RIGHT.")
+        else:
+            perf = ("At or below chance level — "
+                    "no meaningful discrimination detected.")
+
+        # ── Progressive trend ──
+        prog = ""
+        if self._prog_accuracy and self._prog_time_labels:
+            sorted_ns = sorted(self._prog_accuracy.keys())
+            accs = []
+            for ns in sorted_ns:
+                c, t = self._prog_accuracy[ns]
+                accs.append(c / t if t > 0 else 0.0)
+
+            if len(accs) >= 2 and len(self._prog_time_labels) >= 2:
+                t_first = self._prog_time_labels[0]
+                t_last = self._prog_time_labels[-1]
+                a_first = accs[0]
+                a_last = accs[-1]
+
+                # Find the steepest gain segment
+                max_gain = 0.0
+                gain_start_idx = 0
+                for i in range(len(accs) - 1):
+                    gain = accs[i + 1] - accs[i]
+                    if gain > max_gain:
+                        max_gain = gain
+                        gain_start_idx = i
+
+                prog = (
+                    f"Accuracy improves from {a_first:.0%} at "
+                    f"{t_first:.1f}s to {a_last:.0%} at {t_last:.1f}s."
+                )
+                if max_gain > 0.02 and len(self._prog_time_labels) > gain_start_idx + 1:
+                    t_gs = self._prog_time_labels[gain_start_idx]
+                    t_ge = self._prog_time_labels[gain_start_idx + 1]
+                    prog += (
+                        f"  Steepest gain between {t_gs:.1f}–{t_ge:.1f}s "
+                        f"(+{max_gain:.0%})."
+                    )
+
+        return perf, prog
+
     def _show_summary(self, final: bool = True) -> None:
         """
         Replace live-feed widgets with a summary view.
@@ -1201,10 +1295,20 @@ class AppUI:
             else int(self._trial_idx / max(1, len(self.simulator.X)) * 100)
         )
         self.lbl_status.config(text=status_text, fg=self.FG_COLOR)
-        self.lbl_prediction.config(text="", bg=self.BG_COLOR)
-        self.lbl_actual.config(text="")
 
-        # Confidence canvas → Progressive Accuracy Curve
+        # Dynamic conclusion
+        perf_line, prog_line = self._generate_conclusion(acc)
+        self.lbl_prediction.config(
+            text=perf_line, bg=self.BG_COLOR, fg=self.FG_COLOR,
+            font=("Helvetica Neue", 11),
+        )
+        self.lbl_actual.config(
+            text=prog_line, fg="#57606a",
+            font=("Helvetica Neue", 10),
+        )
+
+        # Confidence canvas → Progressive Accuracy Curve (needs more height)
+        self._conf_canvas.config(height=100)
         if self._prog_accuracy and self._prog_time_labels:
             draw_progressive_accuracy(
                 self._conf_canvas, self._prog_accuracy,
