@@ -215,6 +215,10 @@ class BCIModel:
         if not self.is_trained:
             raise RuntimeError("Model is not trained yet.")
         if not self.pipelines:
+            # Defensive fallback: progressive mode is off so no sub-window
+            # pipelines exist.  Use the full-window pipeline on the complete
+            # epoch (no truncation to n_samples).  This path should not be
+            # reached during normal progressive streaming.
             pred = self.predict(X_epoch)
             return pred, self.predict_proba_single(X_epoch)
         if n_samples not in self.pipelines:

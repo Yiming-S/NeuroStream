@@ -21,10 +21,20 @@ from data_engine import DataEngine
 from model import BCIModel
 from streaming import StreamingSimulator
 from .plots import (
+    draw_accuracy_curve,
     draw_band_power,
     draw_confidence,
     draw_confusion_matrix,
+    draw_progressive_accuracy,
     draw_trial_chart,
+)
+from .widgets import (
+    CollapsibleSection,
+    PhaseIndicator,
+    Tooltip,
+    TweenEngine,
+    WelcomeOverlay,
+    make_card,
 )
 
 _LOGO_PATH = Path(__file__).resolve().parent / "img" / "neurostream.png"
@@ -95,8 +105,13 @@ class AppUI:
         self._conf_matrix: list = [[0, 0], [0, 0]]
         self._prog_sample_points: list[int] = []
         self._prog_time_labels: list[float] = []
+        self._prog_accuracy: dict[int, list[int]] = {}  # ns -> [correct, total]
+        self._last_proba: np.ndarray = np.array([0.5, 0.5])
+        self._last_bp: np.ndarray = np.array([0.0, 0.0])
+        self._showing_summary: bool = False
 
         self._build_ui()
+        self._tween = TweenEngine(self.root)
 
     # ══════════════════════════════════════════════════════════════════
     # UI Construction
@@ -136,6 +151,14 @@ class AppUI:
             font=("Helvetica Neue", 10),
             bg=self.BG_COLOR, fg="#57606a",
         ).pack(pady=(6, 0))
+
+        tk.Label(
+            title_block,
+            text="Yiming Shen  ·  Department of Mathematics  ·  "
+                 "University of Massachusetts Boston",
+            font=("Helvetica Neue", 9),
+            bg=self.BG_COLOR, fg="#8c959f",
+        ).pack(pady=(3, 0))
 
         tk.Frame(self.root, height=1, bg="#d0d7de").pack(fill=tk.X, padx=20)
 
@@ -256,10 +279,11 @@ class AppUI:
                 w.bind("<Button-1>", on_click)
             self._btns[name] = (f, dot, lbl)
 
-        _make_btn("train", "⚙   Train & Load", self._on_train)
-        _make_btn("start", "▶   Start Stream",  self._on_start)
-        _make_btn("pause", "⏸   Pause",          self._on_pause)
-        _make_btn("stop",  "⏹   Stop",           self._on_stop)
+        _make_btn("train",   "⚙   Train & Load", self._on_train)
+        _make_btn("start",   "▶   Start Stream",  self._on_start)
+        _make_btn("pause",   "⏸   Pause",          self._on_pause)
+        _make_btn("stop",    "⏹   Stop",           self._on_stop)
+        _make_btn("summary", "📊   Summary",       self._on_summary)
         self._update_button_states("idle")
 
         # ── Section 3: Parameters (scrollable) ────────────────────────
@@ -320,9 +344,9 @@ class AppUI:
             val_lbl.pack(side=tk.RIGHT, padx=(4, 0))
             self._sliders[key] = var
 
-        def section(title, color="#0969da"):
+        def section(title, color="#0969da", parent=None):
             frm = tk.LabelFrame(
-                inner, text=f" {title} ",
+                parent or inner, text=f" {title} ",
                 font=("Helvetica Neue", 9, "bold"),
                 bg=self.BG_COLOR, fg=color,
                 relief=tk.GROOVE, bd=1, padx=4, pady=3,
@@ -330,27 +354,164 @@ class AppUI:
             frm.pack(fill=tk.X, padx=8, pady=(6, 0))
             return frm
 
-        def hint(parent_frame, text):
-            tk.Label(parent_frame, text=text,
-                     font=("Helvetica Neue", 8), bg=self.BG_COLOR, fg="#57606a",
-                     wraplength=230, justify="left",
-                     ).pack(anchor="w", padx=2, pady=(0, 2))
+        # Training Setup
+        tr = section("Training Setup", color="#1a7f37")
+
+        def add_entry_row(parent, label, key, default, width=8):
+            row = tk.Frame(parent, bg=self.BG_COLOR)
+            row.pack(fill=tk.X, padx=6, pady=2)
+            tk.Label(row, text=label, width=18, anchor="w",
+                     font=("Helvetica Neue", 9),
+                     bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
+            var = tk.StringVar(value=str(default))
+            tk.Entry(row, textvariable=var, width=width,
+                     font=("Helvetica Neue", 9),
+                     bg="#ffffff", fg=self.FG_COLOR,
+                     insertbackground=self.FG_COLOR,
+                     relief=tk.FLAT, bd=3).pack(side=tk.LEFT)
+            self._entries[key] = var
+            return row
+
+        # ── Evaluation Protocol selector ─────────────────────────────────
+        protocol_row = tk.Frame(tr, bg=self.BG_COLOR)
+        protocol_row.pack(fill=tk.X, padx=6, pady=(4, 2))
+        tk.Label(protocol_row, text="Evaluation Protocol:", width=18, anchor="w",
+                 font=("Helvetica Neue", 9, "bold"),
+                 bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
+        self._protocol_var = tk.StringVar(value=self.config.evaluation_protocol)
+        protocol_cb = ttk.Combobox(
+            protocol_row, textvariable=self._protocol_var,
+            values=["Cross-Subject", "Cross-Session"],
+            width=14, state="readonly",
+        )
+        protocol_cb.pack(side=tk.LEFT)
+
+        self._protocol_tooltip = Tooltip(protocol_cb, "")
+
+        # ── Cross-Subject parameter rows ─────────────────────────────────
+        self._cross_subject_rows = tk.Frame(tr, bg=self.BG_COLOR)
+        self._cross_subject_rows.pack(fill=tk.X)
+        add_entry_row(self._cross_subject_rows,
+                      "Train Subjects:",  "train_subjects",
+                      "1,2", width=8)
+        add_entry_row(self._cross_subject_rows,
+                      "Test Subject:",    "test_subject",
+                      self.config.test_subject, width=5)
+
+        # ── Cross-Session parameter rows ─────────────────────────────────
+        self._cross_session_rows = tk.Frame(tr, bg=self.BG_COLOR)
+        # (not packed initially — shown only when Cross-Session is selected)
+        add_entry_row(self._cross_session_rows,
+                      "Subject:",         "cross_session_subject",
+                      self.config.cross_session_subject, width=5)
+        add_entry_row(self._cross_session_rows,
+                      "Train Sessions:",  "train_sessions",
+                      "0,1", width=8)
+        add_entry_row(self._cross_session_rows,
+                      "Test Session:",    "test_session",
+                      self.config.test_session, width=5)
+
+        def _on_protocol_change(*_):
+            protocol = self._protocol_var.get()
+            if protocol == "Cross-Subject":
+                self._cross_session_rows.pack_forget()
+                self._cross_subject_rows.pack(fill=tk.X)
+                self._protocol_tooltip.update_text(
+                    "Train on data from multiple subjects. "
+                    "Test on a different held-out subject.")
+            else:  # Cross-Session
+                self._cross_subject_rows.pack_forget()
+                self._cross_session_rows.pack(fill=tk.X)
+                self._protocol_tooltip.update_text(
+                    "Train on earlier sessions of one subject. "
+                    "Test on a later session of the same subject. "
+                    "Zhou2016 has sessions 0, 1, 2.")
+            self.root.after(50, lambda: inner.event_generate("<Configure>"))
+
+        protocol_cb.bind("<<ComboboxSelected>>", _on_protocol_change)
+        _on_protocol_change()   # set initial state
+
+        # ── Feature Extraction ──────────────────────────────────────────
+        feat_row = tk.Frame(tr, bg=self.BG_COLOR)
+        feat_row.pack(fill=tk.X, padx=6, pady=2)
+        tk.Label(feat_row, text="Feature Extraction:", width=16, anchor="w",
+                 font=("Helvetica Neue", 9),
+                 bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
+        self._feat_var = tk.StringVar(value="CSP")
+        feat_cb = ttk.Combobox(feat_row, textvariable=self._feat_var,
+                               values=["CSP", "FBCSP", "TS (Riemannian)"],
+                               width=14, state="readonly")
+        feat_cb.pack(side=tk.LEFT)
+
+        self._feat_tooltip = Tooltip(feat_cb, "")
+
+        # ── Classifier ──────────────────────────────────────────────────
+        clf_row = tk.Frame(tr, bg=self.BG_COLOR)
+        clf_row.pack(fill=tk.X, padx=6, pady=2)
+        tk.Label(clf_row, text="Classifier:", width=16, anchor="w",
+                 font=("Helvetica Neue", 9),
+                 bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
+        self._clf_var = tk.StringVar(value=self.config.clf_type)
+        self._clf_cb  = ttk.Combobox(clf_row, textvariable=self._clf_var,
+                                     values=["LDA", "SVM"],
+                                     width=8, state="readonly")
+        self._clf_cb.pack(side=tk.LEFT)
+
+        # Wire up the dynamic update
+        def _on_feat_change(*_):
+            feat = self._feat_var.get()
+            if feat == "CSP":
+                self._sp_frame.pack(fill=tk.X, padx=8, pady=(6, 0))
+                self._bands_row.pack_forget()
+                self._clf_cb.config(values=["LDA", "SVM"])
+                if self._clf_var.get() == "MDM":
+                    self._clf_var.set("LDA")
+                self._feat_tooltip.update_text(
+                    "Single bandpass → CSP spatial filters → LDA/SVM. "
+                    "Classic MOABB baseline (Jayaram & Barachant 2018).")
+            elif feat == "FBCSP":
+                self._sp_frame.pack(fill=tk.X, padx=8, pady=(6, 0))
+                self._bands_row.pack(fill=tk.X, padx=6, pady=2)
+                self._clf_cb.config(values=["LDA", "SVM"])
+                if self._clf_var.get() == "MDM":
+                    self._clf_var.set("LDA")
+                self._feat_tooltip.update_text(
+                    "FilterBankLeftRightImagery (moabb): CSP per band, "
+                    "features concatenated → LDA/SVM. Ang et al. 2012.")
+            else:  # TS (Riemannian)
+                self._sp_frame.pack_forget()
+                self._clf_cb.config(values=["LDA", "SVM", "MDM"])
+                self._feat_tooltip.update_text(
+                    "pyriemann: covariances → Tangent Space (LDA/SVM) "
+                    "or Minimum Distance to Mean (MDM). "
+                    "Barachant et al. 2012/2013.")
+            self.root.after(50, lambda: inner.event_generate("<Configure>"))
+
+        feat_cb.bind("<<ComboboxSelected>>", _on_feat_change)
+
+        # ── Advanced (collapsible) ────────────────────────────────────
+        self._advanced = CollapsibleSection(
+            inner, title="\u2699  Advanced Parameters  \u25b8", collapsed=True,
+            bg=self.BG_COLOR, fg=self.ACCENT, accent=self.ACCENT,
+        )
+        self._advanced.pack(fill=tk.X)
 
         # Bandpass Filter
-        bp = section("Bandpass Filter")
-        hint(bp, "Retain mu (8-12 Hz) and beta (13-30 Hz) motor rhythms, reject noise")
+        bp = section("Bandpass Filter", parent=self._advanced.content)
+        Tooltip(bp, "Retain mu (8-12 Hz) and beta (13-30 Hz) motor rhythms, reject noise.")
         add_slider(bp, "Low:",  "f_low",  1.0, 30.0, self.config.f_low)
         add_slider(bp, "High:", "f_high", 10.0, 60.0, self.config.f_high)
 
         # Epoch Window
-        ep = section("Epoch Window")
-        hint(ep, "EEG segment per trial, relative to stimulus onset (seconds)")
+        ep = section("Epoch Window", parent=self._advanced.content)
+        Tooltip(ep, "EEG segment per trial, relative to stimulus onset (seconds).")
         add_slider(ep, "Start:", "t_min", -1.0, 2.0, self.config.t_min)
         add_slider(ep, "End:",   "t_max",  0.5, 8.0, self.config.t_max)
 
         # Progressive Prediction
-        pg = section("Progressive Prediction", color="#7d4e00")
-        hint(pg, "Refresh tentative predictions during EEG collection at sub-windows.")
+        pg = section("Progressive Prediction", color="#7d4e00",
+                     parent=self._advanced.content)
+        Tooltip(pg, "Refresh tentative predictions during EEG collection at sub-windows.")
 
         prog_toggle_row = tk.Frame(pg, bg=self.BG_COLOR)
         prog_toggle_row.pack(fill=tk.X, padx=6, pady=(2, 0))
@@ -412,7 +573,8 @@ class AppUI:
         _sync_progressive_controls()
 
         # Spatial Filters — shown for CSP and FBCSP, hidden for TS
-        self._sp_frame = section("Spatial Filters")
+        self._sp_frame = section("Spatial Filters",
+                                 parent=self._advanced.content)
         add_slider(self._sp_frame, "Filters (n):", "csp_components", 2, 14,
                    self.config.csp_components, is_int=True)
 
@@ -431,151 +593,7 @@ class AppUI:
                  font=("Helvetica Neue", 8),
                  bg=self.BG_COLOR, fg="#57606a").pack(side=tk.LEFT)
 
-        # Training Setup
-        tr = section("Training Setup", color="#1a7f37")
-
-        def add_entry_row(parent, label, key, default, width=8):
-            row = tk.Frame(parent, bg=self.BG_COLOR)
-            row.pack(fill=tk.X, padx=6, pady=2)
-            tk.Label(row, text=label, width=18, anchor="w",
-                     font=("Helvetica Neue", 9),
-                     bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
-            var = tk.StringVar(value=str(default))
-            tk.Entry(row, textvariable=var, width=width,
-                     font=("Helvetica Neue", 9),
-                     bg="#ffffff", fg=self.FG_COLOR,
-                     insertbackground=self.FG_COLOR,
-                     relief=tk.FLAT, bd=3).pack(side=tk.LEFT)
-            self._entries[key] = var
-            return row
-
-        # ── Evaluation Protocol selector ─────────────────────────────────
-        protocol_row = tk.Frame(tr, bg=self.BG_COLOR)
-        protocol_row.pack(fill=tk.X, padx=6, pady=(4, 2))
-        tk.Label(protocol_row, text="Evaluation Protocol:", width=18, anchor="w",
-                 font=("Helvetica Neue", 9, "bold"),
-                 bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
-        self._protocol_var = tk.StringVar(value=self.config.evaluation_protocol)
-        protocol_cb = ttk.Combobox(
-            protocol_row, textvariable=self._protocol_var,
-            values=["Cross-Subject", "Cross-Session"],
-            width=14, state="readonly",
-        )
-        protocol_cb.pack(side=tk.LEFT)
-
-        # Protocol description label
-        self._protocol_hint_lbl = tk.Label(
-            tr, text="", font=("Helvetica Neue", 8),
-            bg=self.BG_COLOR, fg="#57606a", wraplength=230, justify="left",
-        )
-        self._protocol_hint_lbl.pack(anchor="w", padx=8, pady=(0, 4))
-
-        # ── Cross-Subject parameter rows ─────────────────────────────────
-        self._cross_subject_rows = tk.Frame(tr, bg=self.BG_COLOR)
-        self._cross_subject_rows.pack(fill=tk.X)
-        add_entry_row(self._cross_subject_rows,
-                      "Train Subjects:",  "train_subjects",
-                      "1,2", width=8)
-        add_entry_row(self._cross_subject_rows,
-                      "Test Subject:",    "test_subject",
-                      self.config.test_subject, width=5)
-
-        # ── Cross-Session parameter rows ─────────────────────────────────
-        self._cross_session_rows = tk.Frame(tr, bg=self.BG_COLOR)
-        # (not packed initially — shown only when Cross-Session is selected)
-        add_entry_row(self._cross_session_rows,
-                      "Subject:",         "cross_session_subject",
-                      self.config.cross_session_subject, width=5)
-        add_entry_row(self._cross_session_rows,
-                      "Train Sessions:",  "train_sessions",
-                      "0,1", width=8)
-        add_entry_row(self._cross_session_rows,
-                      "Test Session:",    "test_session",
-                      self.config.test_session, width=5)
-
-        def _on_protocol_change(*_):
-            protocol = self._protocol_var.get()
-            if protocol == "Cross-Subject":
-                self._cross_session_rows.pack_forget()
-                self._cross_subject_rows.pack(fill=tk.X)
-                self._protocol_hint_lbl.config(
-                    text="Train on data from multiple subjects. "
-                         "Test on a different held-out subject.")
-            else:  # Cross-Session
-                self._cross_subject_rows.pack_forget()
-                self._cross_session_rows.pack(fill=tk.X)
-                self._protocol_hint_lbl.config(
-                    text="Train on earlier sessions of one subject. "
-                         "Test on a later session of the same subject. "
-                         "Zhou2016 has sessions 0, 1, 2.")
-            self.root.after(50, lambda: inner.event_generate("<Configure>"))
-
-        protocol_cb.bind("<<ComboboxSelected>>", _on_protocol_change)
-        _on_protocol_change()   # set initial state
-
-        # ── Feature Extraction ──────────────────────────────────────────
-        feat_row = tk.Frame(tr, bg=self.BG_COLOR)
-        feat_row.pack(fill=tk.X, padx=6, pady=2)
-        tk.Label(feat_row, text="Feature Extraction:", width=16, anchor="w",
-                 font=("Helvetica Neue", 9),
-                 bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
-        self._feat_var = tk.StringVar(value="CSP")
-        feat_cb = ttk.Combobox(feat_row, textvariable=self._feat_var,
-                               values=["CSP", "FBCSP", "TS (Riemannian)"],
-                               width=14, state="readonly")
-        feat_cb.pack(side=tk.LEFT)
-
-        # Hint label that updates when feature extraction changes
-        self._feat_hint_lbl = tk.Label(tr, text="",
-                                       font=("Helvetica Neue", 8),
-                                       bg=self.BG_COLOR, fg="#57606a",
-                                       wraplength=230, justify="left")
-        self._feat_hint_lbl.pack(anchor="w", padx=8, pady=(0, 2))
-
-        # ── Classifier ──────────────────────────────────────────────────
-        clf_row = tk.Frame(tr, bg=self.BG_COLOR)
-        clf_row.pack(fill=tk.X, padx=6, pady=2)
-        tk.Label(clf_row, text="Classifier:", width=16, anchor="w",
-                 font=("Helvetica Neue", 9),
-                 bg=self.BG_COLOR, fg=self.FG_COLOR).pack(side=tk.LEFT)
-        self._clf_var = tk.StringVar(value=self.config.clf_type)
-        self._clf_cb  = ttk.Combobox(clf_row, textvariable=self._clf_var,
-                                     values=["LDA", "SVM"],
-                                     width=8, state="readonly")
-        self._clf_cb.pack(side=tk.LEFT)
-
-        # Wire up the dynamic update
-        def _on_feat_change(*_):
-            feat = self._feat_var.get()
-            if feat == "CSP":
-                self._sp_frame.pack(fill=tk.X, padx=8, pady=(6, 0), before=tr)
-                self._bands_row.pack_forget()
-                self._clf_cb.config(values=["LDA", "SVM"])
-                if self._clf_var.get() == "MDM":
-                    self._clf_var.set("LDA")
-                self._feat_hint_lbl.config(
-                    text="Single bandpass → CSP spatial filters → LDA/SVM. "
-                         "Classic MOABB baseline (Jayaram & Barachant 2018).")
-            elif feat == "FBCSP":
-                self._sp_frame.pack(fill=tk.X, padx=8, pady=(6, 0), before=tr)
-                self._bands_row.pack(fill=tk.X, padx=6, pady=2)
-                self._clf_cb.config(values=["LDA", "SVM"])
-                if self._clf_var.get() == "MDM":
-                    self._clf_var.set("LDA")
-                self._feat_hint_lbl.config(
-                    text="FilterBankLeftRightImagery (moabb): CSP per band, "
-                         "features concatenated → LDA/SVM. Ang et al. 2012.")
-            else:  # TS (Riemannian)
-                self._sp_frame.pack_forget()
-                self._clf_cb.config(values=["LDA", "SVM", "MDM"])
-                self._feat_hint_lbl.config(
-                    text="pyriemann: covariances → Tangent Space (LDA/SVM) "
-                         "or Minimum Distance to Mean (MDM). "
-                         "Barachant et al. 2012/2013.")
-            self.root.after(50, lambda: inner.event_generate("<Configure>"))
-
-        feat_cb.bind("<<ComboboxSelected>>", _on_feat_change)
-        _on_feat_change()   # set initial state
+        _on_feat_change()   # set initial state (after _sp_frame exists)
 
         tk.Frame(inner, height=8, bg=self.BG_COLOR).pack()   # bottom padding
 
@@ -589,6 +607,14 @@ class AppUI:
             relief=tk.RIDGE, bd=2,
         )
         panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=4)
+        self._display_panel = panel   # keep reference for overlay
+
+        # Phase indicator
+        self._phase_indicator = PhaseIndicator(
+            panel, bg=self.BG_COLOR,
+            accent=self.ACCENT, green=self.GREEN, grey="#8c959f",
+        )
+        self._phase_indicator.pack(fill=tk.X, padx=10, pady=(6, 2))
 
         def make_label(text, font_size=14, color=None):
             lbl = tk.Label(panel, text=text,
@@ -624,35 +650,47 @@ class AppUI:
         self.lbl_accuracy  = make_label("Online Accuracy:  —", 14, self.FG_COLOR)
         self.lbl_train_acc = make_label("—", 11, "#888")
 
-        # Trial history chart
-        tk.Frame(panel, height=2, bg="#333").pack(fill=tk.X, padx=20, pady=(8, 4))
-        tk.Label(panel, text="Trial-by-Trial History",
-                 font=("Helvetica Neue", 9), bg=self.BG_COLOR, fg="#57606a").pack()
-        self._chart_canvas = tk.Canvas(panel, height=100, bg="#eaeef2",
+        # Trial history chart (card)
+        chart_outer, chart_card = make_card(
+            panel, "Trial-by-Trial History",
+            bg=self.BG_COLOR, card_bg="#ffffff", fg="#57606a",
+        )
+        chart_outer.pack(fill=tk.X, padx=16, pady=(8, 4))
+        self._chart_canvas = tk.Canvas(chart_card, height=100, bg="#ffffff",
                                        highlightthickness=0)
-        self._chart_canvas.pack(fill=tk.X, padx=20, pady=(2, 4))
+        self._chart_canvas.pack(fill=tk.X, padx=6, pady=6)
 
-        # Band Power + Confusion Matrix (side by side)
+        # Band Power + Confusion Matrix (side by side, cards)
         vis_row = tk.Frame(panel, bg=self.BG_COLOR)
-        vis_row.pack(fill=tk.X, padx=20, pady=(0, 8))
+        vis_row.pack(fill=tk.X, padx=16, pady=(0, 8))
 
-        bp_col = tk.Frame(vis_row, bg=self.BG_COLOR)
-        bp_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tk.Label(bp_col, text="Band Power  (μ / β)",
-                 font=("Helvetica Neue", 9), bg=self.BG_COLOR, fg="#57606a").pack()
-        self._bp_canvas = tk.Canvas(bp_col, height=80, bg="#eaeef2",
+        bp_outer, bp_card = make_card(
+            vis_row, "Band Power  (\u03bc / \u03b2)",
+            bg=self.BG_COLOR, card_bg="#ffffff", fg="#57606a",
+        )
+        bp_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._bp_canvas = tk.Canvas(bp_card, height=80, bg="#ffffff",
                                     highlightthickness=0)
-        self._bp_canvas.pack(fill=tk.X, pady=(2, 0))
+        self._bp_canvas.pack(fill=tk.X, padx=6, pady=6)
 
         tk.Frame(vis_row, width=8, bg=self.BG_COLOR).pack(side=tk.LEFT)
 
-        cm_col = tk.Frame(vis_row, bg=self.BG_COLOR)
-        cm_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tk.Label(cm_col, text="Confusion Matrix",
-                 font=("Helvetica Neue", 9), bg=self.BG_COLOR, fg="#57606a").pack()
-        self._cm_canvas = tk.Canvas(cm_col, height=80, bg="#eaeef2",
+        cm_outer, cm_card = make_card(
+            vis_row, "Confusion Matrix",
+            bg=self.BG_COLOR, card_bg="#ffffff", fg="#57606a",
+        )
+        cm_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._cm_canvas = tk.Canvas(cm_card, height=80, bg="#ffffff",
                                     highlightthickness=0)
-        self._cm_canvas.pack(fill=tk.X, pady=(2, 0))
+        self._cm_canvas.pack(fill=tk.X, padx=6, pady=6)
+
+        # Welcome overlay — shown until first training completes
+        logo_img = getattr(self, "_logo_img", None)
+        self._welcome = WelcomeOverlay(
+            panel, bg=self.BG_COLOR, fg=self.FG_COLOR,
+            accent=self.ACCENT, logo_image=logo_img,
+        )
+        self._welcome.show()
 
     # ══════════════════════════════════════════════════════════════════
     # Parameter Reading
@@ -738,16 +776,6 @@ class AppUI:
             )
             return False
 
-        if self.config.progressive and self.config.pipeline_type in {"CSP", "FBCSP"}:
-            estimated_sfreq = 250.0  # Zhou2016 sampling rate
-            min_samples = int(round(self.config.prog_step * estimated_sfreq))
-            if min_samples < self.config.csp_components:
-                messagebox.showerror(
-                    "Parameter Error",
-                    "Progressive step is too short for the current CSP component count.",
-                )
-                return False
-
         if self.config.evaluation_protocol == "Cross-Session":
             if self.config.test_session in self.config.train_sessions:
                 messagebox.showerror(
@@ -808,6 +836,12 @@ class AppUI:
         self._total     = 0
         self._history   = []
         self._conf_matrix = [[0, 0], [0, 0]]
+        self._prog_accuracy = {ns: [0, 0] for ns in self._prog_sample_points}
+        self._last_proba = np.array([0.5, 0.5])
+        self._last_bp = np.array([0.0, 0.0])
+        self._showing_summary = False
+        self._tween.cancel("confidence")
+        self._tween.cancel("band_power")
         self.simulator.reset()
         for c in (self._chart_canvas, self._conf_canvas,
                   self._bp_canvas, self._cm_canvas):
@@ -827,15 +861,33 @@ class AppUI:
             self._update_button_states("paused")
             self._set_status("Paused.")
         else:
+            # Restore live UI if we were showing summary
+            if self._showing_summary:
+                self._showing_summary = False
+                self.lbl_trial.config(fg="#888", font=("Helvetica Neue", 12))
+                self.lbl_countdown.config(
+                    fg=self.YELLOW, font=("Helvetica Neue", 20))
+                self.lbl_prediction.config(
+                    text="Prediction:  —", fg=self.ACCENT)
+                self.lbl_actual.config(text="Actual:  —", fg="#8c959f")
+                self._conf_canvas.delete("all")
+                self._bp_canvas.delete("all")
             lbl.config(text="⏸   Pause")
             self._update_button_states("streaming")
             self._pulse_stop()
             self._set_status("Streaming …")
             self.root.after(200, self._stream_loop)
 
+    def _on_summary(self) -> None:
+        """Show in-progress summary while paused."""
+        if not self._paused or not self._running:
+            return
+        self._show_summary(final=False)
+
     def _on_stop(self) -> None:
         self._running = False
         self._paused  = False
+        self._showing_summary = False
         _, _, lbl = self._btns["pause"]
         lbl.config(text="⏸   Pause")
         self._update_button_states("ready")
@@ -865,6 +917,19 @@ class AppUI:
             duration = self.config.t_max - self.config.t_min
             sfreq_train = X_train.shape[2] / duration
             self.model = BCIModel(self.config)
+
+            if (
+                self.config.progressive
+                and self.config.pipeline_type in {"CSP", "FBCSP"}
+            ):
+                min_samples = int(round(self.config.prog_step * sfreq_train))
+                if min_samples < self.config.csp_components:
+                    raise ValueError(
+                        f"Progressive step {self.config.prog_step}s gives "
+                        f"{min_samples} samples at {sfreq_train:.0f} Hz, "
+                        f"but CSP needs at least {self.config.csp_components} "
+                        f"samples. Increase step or reduce CSP components."
+                    )
 
             if self.config.progressive:
                 time_points = self._compute_time_points()
@@ -897,14 +962,28 @@ class AppUI:
             self.root.after(0, lambda: self._on_train_error(err_msg))
 
     def _on_train_done(self, train_acc: float, n_test_trials: int) -> None:
-        subj_str = ", ".join(f"S{s}" for s in self.config.train_subjects)
-        self.lbl_train_acc.config(
-            text=f"Pre-train Accuracy:  {train_acc:.1%}   [trained on: {subj_str}]"
-        )
-        self._set_status(
-            f"Model ready.  Test subject {self.config.test_subject}: "
-            f"{n_test_trials} trials queued."
-        )
+        if self.config.evaluation_protocol == "Cross-Session":
+            subj = self.config.cross_session_subject
+            sess_str = ", ".join(str(s) for s in self.config.train_sessions)
+            self.lbl_train_acc.config(
+                text=f"Pre-train Accuracy:  {train_acc:.1%}   "
+                     f"[S{subj}, sessions {sess_str}]"
+            )
+            self._set_status(
+                f"Model ready.  S{subj} session {self.config.test_session}: "
+                f"{n_test_trials} trials queued."
+            )
+        else:
+            subj_str = ", ".join(f"S{s}" for s in self.config.train_subjects)
+            self.lbl_train_acc.config(
+                text=f"Pre-train Accuracy:  {train_acc:.1%}   "
+                     f"[trained on: {subj_str}]"
+            )
+            self._set_status(
+                f"Model ready.  Test subject {self.config.test_subject}: "
+                f"{n_test_trials} trials queued."
+            )
+        self._welcome.dismiss()
         self._update_button_states("ready")
 
     def _on_train_error(self, msg: str) -> None:
@@ -925,11 +1004,7 @@ class AppUI:
         trial = self.simulator.next_trial()
         if trial is None:
             self._on_stop()
-            acc = self._correct / self._total if self._total else 0.0
-            self._set_status(
-                f"Demo complete!  Final accuracy: {acc:.1%}  "
-                f"({self._correct}/{self._total})"
-            )
+            self._show_summary()
             return
 
         epoch, true_label = trial
@@ -937,8 +1012,12 @@ class AppUI:
         self._total     += 1
 
         self.lbl_trial.config(
-            text=f"Trial:  {self._trial_idx}  /  {len(self.simulator.X)}"
+            text=f"Trial:  {self._trial_idx}  /  {len(self.simulator.X)}",
+            fg=self.ACCENT, font=("Helvetica Neue", 14, "bold"),
         )
+        self.root.after(250, lambda: self.lbl_trial.config(
+            fg="#888", font=("Helvetica Neue", 12),
+        ))
         self.lbl_status.config(text="Status:  Collecting EEG …", fg=self.YELLOW)
         self.lbl_prediction.config(text="Prediction:  —", fg=self.ACCENT)
         self.lbl_actual.config(text="Actual:  —", fg="#8c959f")
@@ -982,6 +1061,11 @@ class AppUI:
             ):
                 ns = self._prog_sample_points[next_prog_idx]
                 pred_label, proba = self.model.predict_at(epoch, ns)
+                # Track progressive accuracy
+                if ns in self._prog_accuracy:
+                    self._prog_accuracy[ns][1] += 1
+                    if pred_label == true_label:
+                        self._prog_accuracy[ns][0] += 1
                 self._update_progressive_ui(
                     epoch, pred_label, proba, ns, self._prog_time_labels[next_prog_idx]
                 )
@@ -1022,15 +1106,12 @@ class AppUI:
             fg=self.YELLOW,
         )
 
-        draw_confidence(self._conf_canvas, proba, self.ACCENT, self.FG_COLOR)
+        self._animate_confidence(proba)
         if epoch.ndim == 2:
             sub_epoch = epoch[:, :n_samples]
         else:
             sub_epoch = epoch[:, :n_samples, :]
-        draw_band_power(
-            self._bp_canvas, sub_epoch, self._sfreq,
-            self.ACCENT, self.GREEN, self.FG_COLOR,
-        )
+        self._animate_band_power(sub_epoch)
 
     def _do_predict(self, epoch: np.ndarray, true_label: int) -> None:
         try:
@@ -1051,16 +1132,21 @@ class AppUI:
         self.lbl_prediction.config(text=f"Prediction:  {pred_name}", fg=self.ACCENT)
         self.progress_bar["value"] = 100
 
-        draw_confidence(self._conf_canvas, proba, self.ACCENT, self.FG_COLOR)
-        draw_band_power(self._bp_canvas, epoch, self._sfreq,
-                        self.ACCENT, self.GREEN, self.FG_COLOR)
+        self._animate_confidence(proba)
+        self._animate_band_power(epoch)
 
         def reveal_actual():
-            self.lbl_prediction.config(fg=self.GREEN if is_correct else self.RED)
+            flash_color = self.GREEN if is_correct else self.RED
+            self.lbl_prediction.config(
+                fg="white", bg=flash_color,
+            )
             self.lbl_actual.config(
                 text=f"Actual:  {true_name}",
-                fg=self.GREEN if is_correct else self.RED,
+                fg=flash_color,
             )
+            self.root.after(350, lambda: self.lbl_prediction.config(
+                fg=flash_color, bg=self.BG_COLOR,
+            ))
             acc = self._correct / self._total if self._total else 0.0
             self.lbl_accuracy.config(
                 text=f"Online Accuracy:  {acc:.1%}"
@@ -1079,6 +1165,76 @@ class AppUI:
         self.root.after(self.DISPLAY_INTERVAL_MS, self._stream_loop)
 
     # ══════════════════════════════════════════════════════════════════
+    # Summary View
+    # ══════════════════════════════════════════════════════════════════
+
+    def _show_summary(self, final: bool = True) -> None:
+        """
+        Replace live-feed widgets with a summary view.
+
+        final=True  — demo is over (all trials done or stopped)
+        final=False — in-progress preview while paused
+        """
+        self._showing_summary = True
+        acc = self._correct / self._total if self._total else 0.0
+
+        if final:
+            self._phase_indicator.set_phase("complete")
+            title = "Demo Complete"
+            title_fg = self.GREEN
+            status_text = (f"Final Accuracy   "
+                           f"({self._correct} / {self._total} correct)")
+        else:
+            title = f"Summary  ({self._trial_idx} / {len(self.simulator.X)} trials)"
+            title_fg = self.ACCENT
+            status_text = (f"In-progress Accuracy   "
+                           f"({self._correct} / {self._total} correct)")
+
+        self.lbl_trial.config(text=title, fg=title_fg,
+                              font=("Helvetica Neue", 12, "bold"))
+        self.lbl_countdown.config(
+            text=f"{acc:.1%}", fg=title_fg,
+            font=("Helvetica Neue", 36, "bold"),
+        )
+        self.progress_bar["value"] = (
+            100 if final
+            else int(self._trial_idx / max(1, len(self.simulator.X)) * 100)
+        )
+        self.lbl_status.config(text=status_text, fg=self.FG_COLOR)
+        self.lbl_prediction.config(text="", bg=self.BG_COLOR)
+        self.lbl_actual.config(text="")
+
+        # Confidence canvas → Progressive Accuracy Curve
+        if self._prog_accuracy and self._prog_time_labels:
+            draw_progressive_accuracy(
+                self._conf_canvas, self._prog_accuracy,
+                self._prog_time_labels,
+                self.ACCENT, self.GREEN, self.RED, self.FG_COLOR,
+            )
+        else:
+            self._conf_canvas.delete("all")
+
+        # Band power → cleared
+        self._bp_canvas.delete("all")
+
+        # Trial chart → cumulative accuracy curve
+        draw_accuracy_curve(
+            self._chart_canvas, self._history,
+            self.ACCENT, self.GREEN, self.FG_COLOR,
+        )
+
+        # Confusion matrix
+        draw_confusion_matrix(
+            self._cm_canvas, self._conf_matrix,
+            self.FG_COLOR, self.GREEN, self.RED,
+        )
+
+        self._set_status(
+            f"{'Demo complete' if final else 'Paused — summary preview'}!  "
+            f"Accuracy: {acc:.1%}  ({self._correct}/{self._total})"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
     # Button State Management
     # ══════════════════════════════════════════════════════════════════
 
@@ -1087,14 +1243,16 @@ class AppUI:
         ON_ST = (True,  self._BTN_START_ON, "white",         "#8c959f")
         ON_PA = (True,  "#7d4e00",          "white",         self.YELLOW)
         ON_SP = (True,  self._BTN_STOP_ON,  "white",         self.RED)
+        ON_SU = (True,  self.ACCENT,        "white",         "#8c959f")
         OFF   = (False, self._BTN_OFF,      self._BTN_FG_OFF, "#8c959f")
 
         table = {
-            "idle"     : [ON_TR, OFF,   OFF,   OFF  ],
-            "training" : [OFF,   OFF,   OFF,   OFF  ],
-            "ready"    : [ON_TR, ON_ST, OFF,   OFF  ],
-            "streaming": [OFF,   OFF,   ON_PA, ON_SP],
-            "paused"   : [OFF,   ON_ST, ON_PA, ON_SP],
+            #          train  start  pause  stop   summary
+            "idle"     : [ON_TR, OFF,   OFF,   OFF,   OFF  ],
+            "training" : [OFF,   OFF,   OFF,   OFF,   OFF  ],
+            "ready"    : [ON_TR, ON_ST, OFF,   OFF,   OFF  ],
+            "streaming": [OFF,   OFF,   ON_PA, ON_SP, OFF  ],
+            "paused"   : [OFF,   ON_ST, ON_PA, ON_SP, ON_SU],
         }
 
         for (name, btn_widgets), cfg in zip(self._btns.items(), table[state]):
@@ -1104,6 +1262,9 @@ class AppUI:
             f.config(bg=bg, cursor="hand2" if enabled else "")
             dot.config(bg=bg, fg=dot_color)
             lbl.config(bg=bg, fg=fg)
+
+        if hasattr(self, "_phase_indicator"):
+            self._phase_indicator.set_phase(state)
 
     def _pulse_stop(self, bright: bool = True) -> None:
         if not self._running or self._paused:
@@ -1120,6 +1281,71 @@ class AppUI:
     # ══════════════════════════════════════════════════════════════════
 
     _CHART_MAX_BARS = 60
+    _TWEEN_MS = 120
+
+    def _animate_confidence(self, proba: np.ndarray) -> None:
+        """Smoothly tween the confidence bar from its last value to proba."""
+        old = self._last_proba.copy()
+        self._last_proba = proba.copy()
+        self._tween.animate(
+            key="confidence",
+            start=old, end=proba,
+            duration_ms=self._TWEEN_MS,
+            on_frame=lambda v: draw_confidence(
+                self._conf_canvas, v, self.ACCENT, self.FG_COLOR),
+        )
+
+    def _animate_band_power(self, epoch: np.ndarray) -> None:
+        """Smoothly tween band power bars from last value to current."""
+        from .plots import band_power
+        if epoch.ndim == 3:
+            draw_band_power(self._bp_canvas, epoch, self._sfreq,
+                            self.ACCENT, self.GREEN, self.FG_COLOR)
+            return
+        new_bp = np.array([
+            band_power(epoch, self._sfreq, 8, 12),
+            band_power(epoch, self._sfreq, 13, 30),
+        ])
+        old = self._last_bp.copy()
+        self._last_bp = new_bp.copy()
+        self._tween.animate(
+            key="band_power",
+            start=old, end=new_bp,
+            duration_ms=self._TWEEN_MS,
+            on_frame=lambda v: self._draw_bp_from_values(v),
+        )
+
+    def _draw_bp_from_values(self, values: np.ndarray) -> None:
+        """Redraw band power bars from pre-computed [mu_frac, beta_frac]."""
+        import tkinter as tk
+        c = self._bp_canvas
+        c.delete("all")
+        c.update_idletasks()
+        W, H = c.winfo_width(), c.winfo_height()
+        if W < 10 or H < 10:
+            return
+        mu_frac, beta_frac = float(values[0]), float(values[1])
+        bands = [
+            ("\u03bc  8\u201312 Hz",  mu_frac,   self.ACCENT),
+            ("\u03b2  13\u201330 Hz", beta_frac, self.GREEN),
+        ]
+        label_h = 16
+        plot_h = H - label_h - 8
+        n = len(bands)
+        gap = 10
+        bar_w = (W - (n + 1) * gap) // n
+        for i, (label, frac, color) in enumerate(bands):
+            x0 = gap + i * (bar_w + gap)
+            x1 = x0 + bar_w
+            c.create_rectangle(x0, 4, x1, H - label_h - 4,
+                               fill="#d0d7de", outline="")
+            fill_h = max(2, int(frac * plot_h))
+            c.create_rectangle(x0, H - label_h - 4 - fill_h, x1,
+                               H - label_h - 4, fill=color, outline="")
+            c.create_text((x0 + x1) // 2, H - label_h // 2 - 2,
+                          text=f"{label}  {frac:.0%}",
+                          fill=self.FG_COLOR, font=("Helvetica Neue", 7),
+                          anchor="center")
 
     def _set_status(self, msg: str) -> None:
         self.status_bar.config(text=f"  {msg}")

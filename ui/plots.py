@@ -80,9 +80,7 @@ def draw_band_power(
     if W < 10 or H < 10:
         return
 
-    mu_frac   = band_power(epoch, sfreq, 8,  12)
-    beta_frac = band_power(epoch, sfreq, 13, 30)
-    if epoch.ndim == 3 and mu_frac == 0.0 and beta_frac == 0.0:
+    if epoch.ndim == 3:
         c.create_text(
             W // 2, H // 2,
             text="N/A (Filter Bank)",
@@ -91,6 +89,8 @@ def draw_band_power(
             anchor="center",
         )
         return
+    mu_frac   = band_power(epoch, sfreq, 8,  12)
+    beta_frac = band_power(epoch, sfreq, 13, 30)
     bands = [
         ("μ  8–12 Hz",  mu_frac,   accent),
         ("β  13–30 Hz", beta_frac, green),
@@ -254,3 +254,209 @@ def draw_trial_chart(
 
     if len(points) >= 4:
         c.create_line(*points, fill=accent, width=2, smooth=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Accuracy Curve (Summary View)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def draw_accuracy_curve(
+    canvas: tk.Canvas,
+    history: list,
+    accent: str,
+    green: str,
+    fg: str,
+) -> None:
+    """
+    Full-canvas cumulative accuracy curve with axis labels.
+    Used in the post-demo summary view.
+    """
+    c = canvas
+    c.delete("all")
+    c.update_idletasks()
+    W = c.winfo_width()
+    H = c.winfo_height()
+    if W < 10 or H < 10 or not history:
+        return
+
+    AXIS_W  = 38
+    AXIS_H  = 18
+    TOP_PAD = 6
+    plot_x0 = AXIS_W
+    plot_x1 = W - 6
+    plot_y0 = TOP_PAD
+    plot_y1 = H - AXIS_H
+    plot_w  = plot_x1 - plot_x0
+    plot_h  = plot_y1 - plot_y0
+
+    def pct_to_y(p: float) -> int:
+        return plot_y1 - int(p * plot_h)
+
+    def trial_to_x(i: int) -> int:
+        return plot_x0 + int(i / max(len(history) - 1, 1) * plot_w)
+
+    # Grid lines and Y-axis labels
+    for pct in (0.0, 0.25, 0.50, 0.75, 1.0):
+        y = pct_to_y(pct)
+        c.create_line(plot_x0, y, plot_x1, y, fill="#d0d7de", dash=(3, 5))
+        c.create_text(AXIS_W - 3, y, text=f"{int(pct * 100)}%",
+                      anchor="e", fill="#57606a", font=("Helvetica Neue", 7))
+
+    # X-axis labels
+    n = len(history)
+    for frac in (0.0, 0.5, 1.0):
+        idx = int(frac * (n - 1)) if n > 1 else 0
+        x = trial_to_x(idx)
+        c.create_text(x, plot_y1 + 10, text=str(idx + 1),
+                      anchor="center", fill="#57606a",
+                      font=("Helvetica Neue", 7))
+
+    # Axis title
+    c.create_text((plot_x0 + plot_x1) // 2, H - 2, text="Trial",
+                  anchor="s", fill="#57606a", font=("Helvetica Neue", 7))
+
+    # 50% chance line
+    y50 = pct_to_y(0.5)
+    c.create_line(plot_x0, y50, plot_x1, y50, fill="#cf222e",
+                  dash=(6, 4), width=1)
+    c.create_text(plot_x1 + 2, y50, text="chance", anchor="w",
+                  fill="#cf222e", font=("Helvetica Neue", 6))
+
+    # Cumulative accuracy curve
+    points = []
+    running_correct = 0
+    for i, correct in enumerate(history):
+        running_correct += int(correct)
+        cum_acc = running_correct / (i + 1)
+        points.extend([trial_to_x(i), pct_to_y(cum_acc)])
+
+    if len(points) >= 4:
+        c.create_line(*points, fill=accent, width=2, smooth=True)
+
+    # Final accuracy dot
+    if points:
+        final_x, final_y = points[-2], points[-1]
+        final_acc = running_correct / n
+        c.create_oval(final_x - 4, final_y - 4, final_x + 4, final_y + 4,
+                      fill=green, outline="")
+        c.create_text(final_x, final_y - 10, text=f"{final_acc:.1%}",
+                      fill=green, font=("Helvetica Neue", 9, "bold"),
+                      anchor="s")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Progressive Accuracy Curve (Summary View)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def draw_progressive_accuracy(
+    canvas: tk.Canvas,
+    prog_accuracy: dict,
+    time_labels: list,
+    accent: str,
+    green: str,
+    red: str,
+    fg: str,
+) -> None:
+    """
+    Accuracy at each progressive time window across all trials.
+
+    prog_accuracy : {n_samples: [correct, total], ...}
+    time_labels   : corresponding seconds for each n_samples key
+    """
+    c = canvas
+    c.delete("all")
+    c.update_idletasks()
+    W = c.winfo_width()
+    H = c.winfo_height()
+    if W < 10 or H < 10:
+        return
+
+    # Build sorted (time_s, accuracy) pairs
+    sorted_ns = sorted(prog_accuracy.keys())
+    if not sorted_ns or not time_labels:
+        return
+    ns_to_time = {}
+    for ns, t in zip(sorted(prog_accuracy.keys()), sorted(time_labels)):
+        ns_to_time[ns] = t
+
+    points_data = []
+    for ns in sorted_ns:
+        correct, total = prog_accuracy[ns]
+        if total == 0:
+            continue
+        points_data.append((ns_to_time.get(ns, 0), correct / total))
+
+    if not points_data:
+        c.create_text(W // 2, H // 2, text="No progressive data",
+                      fill="#57606a", font=("Helvetica Neue", 9),
+                      anchor="center")
+        return
+
+    # Layout
+    AXIS_W = 38
+    AXIS_H = 20
+    TOP_PAD = 10
+    plot_x0 = AXIS_W
+    plot_x1 = W - 10
+    plot_y0 = TOP_PAD
+    plot_y1 = H - AXIS_H
+    plot_w = plot_x1 - plot_x0
+    plot_h = plot_y1 - plot_y0
+
+    t_min_val = points_data[0][0]
+    t_max_val = points_data[-1][0]
+    t_range = t_max_val - t_min_val if t_max_val > t_min_val else 1.0
+
+    def t_to_x(t: float) -> int:
+        return plot_x0 + int((t - t_min_val) / t_range * plot_w)
+
+    def acc_to_y(a: float) -> int:
+        return plot_y1 - int(a * plot_h)
+
+    # Grid + Y axis
+    for pct in (0.0, 0.25, 0.50, 0.75, 1.0):
+        y = acc_to_y(pct)
+        c.create_line(plot_x0, y, plot_x1, y, fill="#d0d7de", dash=(3, 5))
+        c.create_text(AXIS_W - 3, y, text=f"{int(pct * 100)}%",
+                      anchor="e", fill="#57606a", font=("Helvetica Neue", 7))
+
+    # X axis labels
+    for t, _ in points_data:
+        x = t_to_x(t)
+        c.create_text(x, plot_y1 + 10, text=f"{t:.1f}s",
+                      anchor="center", fill="#57606a",
+                      font=("Helvetica Neue", 7))
+
+    # Axis title
+    c.create_text((plot_x0 + plot_x1) // 2, H - 2,
+                  text="EEG window length",
+                  anchor="s", fill="#57606a", font=("Helvetica Neue", 7))
+
+    # 50% chance line
+    y50 = acc_to_y(0.5)
+    c.create_line(plot_x0, y50, plot_x1, y50, fill=red,
+                  dash=(6, 4), width=1)
+
+    # Accuracy curve
+    line_points = []
+    for t, acc in points_data:
+        line_points.extend([t_to_x(t), acc_to_y(acc)])
+
+    if len(line_points) >= 4:
+        c.create_line(*line_points, fill=accent, width=2, smooth=True)
+
+    # Dots + labels
+    for t, acc in points_data:
+        x, y = t_to_x(t), acc_to_y(acc)
+        c.create_oval(x - 3, y - 3, x + 3, y + 3, fill=accent, outline="")
+
+    # Label first and last
+    if points_data:
+        t0, a0 = points_data[0]
+        c.create_text(t_to_x(t0), acc_to_y(a0) - 8, text=f"{a0:.0%}",
+                      fill="#57606a", font=("Helvetica Neue", 7, "bold"),
+                      anchor="s")
+        tN, aN = points_data[-1]
+        c.create_text(t_to_x(tN), acc_to_y(aN) - 8, text=f"{aN:.0%}",
+                      fill=green, font=("Helvetica Neue", 8, "bold"),
+                      anchor="s")
