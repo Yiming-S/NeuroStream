@@ -173,7 +173,7 @@ class AppUI:
 
         tk.Label(
             title_block,
-            text="Yiming Shen  ·  Advised by Prof. David Degras  ·  "
+            text="Yiming Shen  ·  David Degras  ·  "
                  "Department of Mathematics  ·  UMass Boston",
             font=("Helvetica Neue", 9),
             bg=self.BG_COLOR, fg="#8c959f",
