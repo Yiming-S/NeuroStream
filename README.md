@@ -239,6 +239,10 @@ NeuroStream/
 - **Sliding-window MI feedback**: Muller-Putz et al. (2010). *Temporal coding of brain patterns for direct limb control in humans.* Front. Neurosci.
 - **Continuous asynchronous BCI**: Townsend, Graimann & Pfurtscheller (2004). *Continuous EEG classification during motor imagery — simulation of an asynchronous BCI.* IEEE Trans. Neural Syst. Rehabil. Eng.
 
+## Acknowledgments
+
+Advised by Prof. David Degras, Department of Mathematics, University of Massachusetts Boston.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
