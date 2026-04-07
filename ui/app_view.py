@@ -3,22 +3,28 @@ ui/app_view.py — tkinter application window.
 
 Threading model
 ───────────────
-Heavy work (data loading + training) runs in a daemon thread and posts
-results back via root.after(0, callback).
-Streaming is driven entirely by root.after() — no time.sleep(), no threads.
+Heavy work (data loading + training) runs in a daemon thread.
+Online streaming uses a background acquisition/inference thread that
+produces ProgressEvent and TrialResult into queue.Queue objects.
+The Tk main thread polls these queues via root.after() and updates the UI.
+FBCSP pipelines fall back to the legacy root.after()-driven replay.
 """
 
+import queue
 import threading
+import time
 import tkinter as tk
+from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
 from config import BCIConfig
 from data_engine import DataEngine
 from model import BCIModel
+from sources import ProgressEvent, ReplaySource, RingBuffer, TrialResult
 from streaming import StreamingSimulator
 from .plots import (
     draw_accuracy_curve,
@@ -90,6 +96,19 @@ class AppUI:
         self.model:       Optional[BCIModel]           = None
         self.simulator:   Optional[StreamingSimulator] = None
 
+        # Online architecture state
+        self._source: Optional[ReplaySource] = None
+        self._buffer: Optional[RingBuffer] = None
+        self._trial_onsets: List[int] = []
+        self._trial_labels: List[Optional[int]] = []
+        self._n_total_trials: int = 0
+        self._progress_queue: queue.Queue = queue.Queue()
+        self._result_queue: queue.Queue = queue.Queue()
+        self._stream_done = threading.Event()
+        self._acq_thread: Optional[threading.Thread] = None
+        self._displaying: bool = False
+        self._demo_result_buffer: deque = deque()
+
         # Runtime state
         self._running   = False
         self._paused    = False
@@ -103,9 +122,9 @@ class AppUI:
         # Visualisation state
         self._sfreq:      float = 250.0
         self._conf_matrix: list = [[0, 0], [0, 0]]
-        self._prog_sample_points: list[int] = []
-        self._prog_time_labels: list[float] = []
-        self._prog_accuracy: dict[int, list[int]] = {}  # ns -> [correct, total]
+        self._prog_sample_points: List[int] = []
+        self._prog_time_labels: List[float] = []
+        self._prog_accuracy: dict = {}  # ns -> [correct, total]
         self._last_proba: np.ndarray = np.array([0.5, 0.5])
         self._last_bp: np.ndarray = np.array([0.0, 0.0])
         self._showing_summary: bool = False
@@ -859,9 +878,10 @@ class AppUI:
         threading.Thread(target=self._train_worker, daemon=True).start()
 
     def _on_start(self) -> None:
-        if self.simulator is None:
+        if self.simulator is None and self._source is None:
             return
         self._running = True
+        self._paused = False
         self._trial_idx = 0
         self._correct   = 0
         self._total     = 0
@@ -871,16 +891,35 @@ class AppUI:
         self._last_proba = np.array([0.5, 0.5])
         self._last_bp = np.array([0.0, 0.0])
         self._showing_summary = False
+        self._displaying = False
+        self._demo_result_buffer.clear()
         self._tween.cancel("confidence")
         self._tween.cancel("band_power")
-        self.simulator.reset()
         for c in (self._chart_canvas, self._conf_canvas,
                   self._bp_canvas, self._cm_canvas):
             c.delete("all")
         self._update_button_states("streaming")
         self._pulse_stop()
-        self._set_status("Streaming …")
-        self.root.after(200, self._stream_loop)
+
+        if self._source is not None:
+            # ── Online architecture path ──
+            self._source.start()
+            self._buffer.reset()
+            self._stream_done.clear()
+            while not self._progress_queue.empty():
+                self._progress_queue.get_nowait()
+            while not self._result_queue.empty():
+                self._result_queue.get_nowait()
+            self._acq_thread = threading.Thread(
+                target=self._acquisition_worker, daemon=True)
+            self._acq_thread.start()
+            self._set_status("Streaming (online) …")
+            self.root.after(20, self._ui_poll)
+        else:
+            # ── FBCSP legacy path ──
+            self.simulator.reset()
+            self._set_status("Streaming …")
+            self.root.after(200, self._stream_loop)
 
     def _on_pause(self) -> None:
         if not self._running:
@@ -889,6 +928,8 @@ class AppUI:
         _, _, lbl = self._btns["pause"]
         if self._paused:
             lbl.config(text="▶   Resume")
+            if isinstance(self._source, ReplaySource):
+                self._source.pause()
             self._update_button_states("paused")
             self._set_status("Paused.")
         else:
@@ -907,11 +948,17 @@ class AppUI:
                 self._conf_canvas.config(height=36)
                 self._conf_canvas.delete("all")
                 self._bp_canvas.delete("all")
+            if isinstance(self._source, ReplaySource):
+                self._source.resume()
             lbl.config(text="⏸   Pause")
             self._update_button_states("streaming")
             self._pulse_stop()
             self._set_status("Streaming …")
-            self.root.after(200, self._stream_loop)
+            if self._source is not None:
+                # Worker thread is still alive (it continues when _paused=False)
+                self.root.after(20, self._ui_poll)
+            else:
+                self.root.after(200, self._stream_loop)
 
     def _on_summary(self) -> None:
         """Show in-progress summary while paused."""
@@ -923,10 +970,16 @@ class AppUI:
         self._running = False
         self._paused  = False
         self._showing_summary = False
+        if self._source is not None:
+            self._source.stop()
         _, _, lbl = self._btns["pause"]
         lbl.config(text="⏸   Pause")
         self._update_button_states("ready")
-        self._set_status("Stopped.")
+        # Show summary if at least one trial was completed
+        if self._total > 0:
+            self._show_summary(final=True)
+        else:
+            self._set_status("Stopped.")
 
     # ══════════════════════════════════════════════════════════════════
     # Training Thread
@@ -947,11 +1000,12 @@ class AppUI:
     def _train_worker(self) -> None:
         try:
             self.data_engine = DataEngine(self.config)
-            X_train, y_train = self.data_engine.get_train_data()
+            X_train, y_train, ea_matrix = self.data_engine.get_train_data()
 
             duration = self.config.t_max - self.config.t_min
             sfreq_train = X_train.shape[2] / duration
             self.model = BCIModel(self.config)
+            self.model.set_ea_matrix(ea_matrix)
 
             if (
                 self.config.progressive
@@ -987,11 +1041,31 @@ class AppUI:
 
             train_acc = self.model.train(X_train, y_train)
 
-            X_test, y_test, sfreq = self.data_engine.get_test_data()
-            self._sfreq    = sfreq
-            self.simulator = StreamingSimulator(X_test, y_test)
+            # ── Set up data source ──
+            use_legacy = (self.config.pipeline_type == "FBCSP")
+            if use_legacy:
+                X_test, y_test, sfreq = self.data_engine.get_test_data(
+                    apply_ea=True)
+                self._sfreq = sfreq
+                self.simulator = StreamingSimulator(X_test, y_test)
+                self._source = None
+            else:
+                X_test, y_test, sfreq = self.data_engine.get_test_data(
+                    apply_ea=False)
+                self._sfreq = sfreq
+                self.simulator = None
+                source = ReplaySource(
+                    X_test, y_test, sfreq,
+                    gap_s=self.config.replay_gap_s)
+                self._source = source
+                self._trial_onsets = source.get_trial_onsets()
+                self._trial_labels = source.get_trial_labels()
+                self._n_total_trials = source.get_n_trials()
+                buf_cap = int(self.config.buffer_capacity_s * sfreq)
+                self._buffer = RingBuffer(source.get_n_channels(), buf_cap)
 
-            self.root.after(0, lambda: self._on_train_done(train_acc, len(X_test)))
+            n_trials = len(X_test)
+            self.root.after(0, lambda: self._on_train_done(train_acc, n_trials))
         except Exception as exc:
             err_msg = str(exc)
             self.root.after(0, lambda: self._on_train_error(err_msg))
@@ -1027,7 +1101,293 @@ class AppUI:
         self._set_status("Training failed. See error dialog.")
 
     # ══════════════════════════════════════════════════════════════════
-    # Streaming Loop (root.after driven)
+    # Online Architecture — background worker + UI poll
+    # ══════════════════════════════════════════════════════════════════
+
+    _ACQ_SLEEP_S = 0.005   # ~200 Hz polling in worker thread
+    _UI_POLL_MS  = 20      # Tk main thread poll interval
+
+    def _acquisition_worker(self) -> None:
+        """
+        Background thread: read source → write buffer → inference.
+        Produces ProgressEvent and TrialResult into queues.
+        Sets _stream_done when all trials are finished.
+        Must NOT touch any Tk widget.
+        """
+        sfreq = self._sfreq
+        epoch_samples = int(round(
+            (self.config.t_max - self.config.t_min) * sfreq))
+        n_trials = self._n_total_trials
+
+        current_trial = 0
+        last_prog_idx = 0
+        correct = 0
+        total = 0
+        conf_matrix = [[0, 0], [0, 0]]
+
+        while self._running:
+            if self._paused:
+                time.sleep(0.02)
+                continue
+
+            # 1. Read from source → write to buffer
+            chunk = self._source.read_chunk()
+            if chunk is not None:
+                self._buffer.write(chunk)
+
+            # 2. All trials done?
+            if current_trial >= n_trials:
+                if self._source.is_exhausted():
+                    self._stream_done.set()
+                    return
+                time.sleep(self._ACQ_SLEEP_S)
+                continue
+
+            # 3. Check current trial
+            onset = self._trial_onsets[current_trial]
+            samples_available = self._buffer.write_pos - onset
+
+            if samples_available <= 0:
+                time.sleep(self._ACQ_SLEEP_S)
+                continue
+
+            # 4. Progressive predictions
+            if self.config.progressive and self._prog_sample_points:
+                n_prog = len(self._prog_sample_points) - 1
+                while (last_prog_idx < n_prog
+                       and samples_available
+                       >= self._prog_sample_points[last_prog_idx]):
+                    ns = self._prog_sample_points[last_prog_idx]
+                    epoch_slice = self._buffer.read(onset, ns)
+                    if epoch_slice is not None:
+                        epoch_slice = self.model.apply_ea(epoch_slice)
+                        pred, proba = self.model.predict_at(
+                            epoch_slice, ns)
+                        self._progress_queue.put(ProgressEvent(
+                            trial_idx=current_trial,
+                            n_samples=ns,
+                            pred_label=pred,
+                            proba=proba.copy(),
+                            epoch_slice=epoch_slice.copy(),
+                        ))
+                        # Track progressive accuracy
+                        true_lbl = self._trial_labels[current_trial]
+                        if ns in self._prog_accuracy:
+                            self._prog_accuracy[ns][1] += 1
+                            if (true_lbl is not None
+                                    and pred == true_lbl):
+                                self._prog_accuracy[ns][0] += 1
+                    last_prog_idx += 1
+
+            # 5. Full epoch arrived → final prediction
+            if samples_available >= epoch_samples:
+                full_epoch = self._buffer.read(onset, epoch_samples)
+                if full_epoch is not None:
+                    full_epoch = self.model.apply_ea(full_epoch)
+                    try:
+                        pred = self.model.predict(full_epoch)
+                        proba = self.model.predict_proba_single(
+                            full_epoch)
+                    except Exception:
+                        pred = -1
+                        proba = np.array([0.5, 0.5])
+
+                    true_label = self._trial_labels[current_trial]
+                    total += 1
+                    if (true_label is not None
+                            and pred == true_label):
+                        correct += 1
+                    if (true_label is not None
+                            and 0 <= true_label <= 1
+                            and 0 <= pred <= 1):
+                        conf_matrix[true_label][pred] += 1
+
+                    self._result_queue.put(TrialResult(
+                        trial_idx=current_trial,
+                        true_label=true_label,
+                        pred_label=pred,
+                        proba=proba.copy(),
+                        epoch=full_epoch.copy(),
+                        correct_so_far=correct,
+                        total_so_far=total,
+                        conf_matrix_snapshot=[
+                            row[:] for row in conf_matrix],
+                    ))
+                    current_trial += 1
+                    last_prog_idx = 0
+
+            time.sleep(self._ACQ_SLEEP_S)
+
+    # ------------------------------------------------------------------
+
+    def _ui_poll(self) -> None:
+        """
+        Tk main thread: drain both queues, update UI.
+        Called every _UI_POLL_MS via root.after.
+        """
+        if not self._running:
+            return
+
+        # ── Check completion ──
+        if self._stream_done.is_set():
+            # Drain remaining results into metrics
+            while not self._result_queue.empty():
+                try:
+                    r = self._result_queue.get_nowait()
+                    self._apply_result_metrics(r)
+                    if self.config.presentation_mode == "demo":
+                        self._demo_result_buffer.append(r)
+                except queue.Empty:
+                    break
+            # Demo: let backlog finish playing before summary
+            if (self.config.presentation_mode == "demo"
+                    and (self._displaying or self._demo_result_buffer)):
+                # Fall through to demo display logic below
+                pass
+            else:
+                self._on_stop()
+                self._show_summary()
+                return
+
+        # ── Drain progress queue → tentative UI ──
+        latest_progress = None  # type: Optional[ProgressEvent]
+        while not self._progress_queue.empty():
+            try:
+                latest_progress = self._progress_queue.get_nowait()
+            except queue.Empty:
+                break
+        if (latest_progress is not None
+                and not self._displaying
+                and not self._showing_summary):
+            self._display_progress(latest_progress)
+
+        # ── Drain result queue → metrics + display ──
+        if self.config.presentation_mode == "live":
+            results = []  # type: List[TrialResult]
+            while not self._result_queue.empty():
+                try:
+                    results.append(self._result_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if results:
+                for r in results:
+                    self._apply_result_metrics(r)
+                self._display_final_result(results[-1])
+        else:
+            # Demo: drain into persistent backlog
+            while not self._result_queue.empty():
+                try:
+                    r = self._result_queue.get_nowait()
+                    self._apply_result_metrics(r)
+                    self._demo_result_buffer.append(r)
+                except queue.Empty:
+                    break
+            # Display next from backlog if UI is idle
+            if not self._displaying and self._demo_result_buffer:
+                r = self._demo_result_buffer.popleft()
+                self._display_final_result(r)
+            # Check again: if stream done and backlog empty and not displaying
+            if (self._stream_done.is_set()
+                    and not self._displaying
+                    and not self._demo_result_buffer):
+                self._on_stop()
+                self._show_summary()
+                return
+
+        self.root.after(self._UI_POLL_MS, self._ui_poll)
+
+    # ------------------------------------------------------------------
+
+    def _apply_result_metrics(self, r: TrialResult) -> None:
+        """Update cumulative counters from a TrialResult. No UI animation."""
+        self._trial_idx = r.trial_idx + 1
+        self._correct = r.correct_so_far
+        self._total = r.total_so_far
+        self._conf_matrix = r.conf_matrix_snapshot
+        if r.true_label is not None:
+            self._history.append(r.pred_label == r.true_label)
+
+    def _display_progress(self, evt: ProgressEvent) -> None:
+        """Update tentative prediction UI from a ProgressEvent."""
+        pred_name = StreamingSimulator.label_name(evt.pred_label)
+        t_label = evt.n_samples / self._sfreq
+        total_s = self.config.t_max - self.config.t_min
+
+        self.lbl_trial.config(
+            text=f"Trial:  {evt.trial_idx + 1}  /  {self._n_total_trials}")
+        self.lbl_prediction.config(
+            text=f"Prediction:  {pred_name}  (tentative, {t_label:.1f}s)",
+            fg="#6e7781")
+        self.lbl_status.config(
+            text=f"Status:  Predicting  ({t_label:.1f}s / {total_s:.1f}s)",
+            fg=self.YELLOW)
+        pct = min(100, int(t_label / total_s * 100))
+        self.progress_bar["value"] = pct
+        self.lbl_countdown.config(
+            text=f"EEG Window:  {t_label:.1f} s  /  {total_s:.1f} s")
+        self._animate_confidence(evt.proba)
+        self._animate_band_power(evt.epoch_slice)
+
+    def _display_final_result(self, r: TrialResult) -> None:
+        """Animate the final prediction + reveal actual for one trial."""
+        self._displaying = True
+        pred_name = StreamingSimulator.label_name(r.pred_label)
+        true_name = (StreamingSimulator.label_name(r.true_label)
+                     if r.true_label is not None else "\u2014")
+        is_correct = ((r.pred_label == r.true_label)
+                      if r.true_label is not None else None)
+
+        self.lbl_trial.config(
+            text=f"Trial:  {r.trial_idx + 1}  /  {self._n_total_trials}",
+            fg=self.ACCENT, font=("Helvetica Neue", 14, "bold"))
+        self.root.after(250, lambda: self.lbl_trial.config(
+            fg="#888", font=("Helvetica Neue", 12)))
+        self.lbl_status.config(
+            text="Status:  Prediction Ready", fg=self.GREEN)
+        self.lbl_prediction.config(
+            text=f"Prediction:  {pred_name}", fg=self.ACCENT,
+            font=("Helvetica Neue", 26))
+        self.progress_bar["value"] = 100
+        self.lbl_countdown.config(
+            text=f"EEG Window:  {self.config.t_max - self.config.t_min:.1f} s"
+                 f"  /  {self.config.t_max - self.config.t_min:.1f} s")
+        self._animate_confidence(r.proba)
+        self._animate_band_power(r.epoch)
+
+        acc = self._correct / self._total if self._total else 0.0
+        self.lbl_accuracy.config(
+            text=f"Online Accuracy:  {acc:.1%}"
+                 f"   ({self._correct} correct  /  {self._total} trials)")
+
+        def reveal_actual():
+            if is_correct is not None:
+                flash_color = self.GREEN if is_correct else self.RED
+                self.lbl_prediction.config(fg="white", bg=flash_color)
+                self.lbl_actual.config(
+                    text=f"Actual:  {true_name}", fg=flash_color)
+                self.root.after(350, lambda: self.lbl_prediction.config(
+                    fg=flash_color, bg=self.BG_COLOR))
+            else:
+                self.lbl_actual.config(
+                    text="Actual:  \u2014 (no ground truth)")
+            draw_trial_chart(self._chart_canvas, self._history,
+                             self._CHART_MAX_BARS,
+                             self.GREEN, self.RED, self.ACCENT, self.FG_COLOR)
+            draw_confusion_matrix(self._cm_canvas, self._conf_matrix,
+                                  self.FG_COLOR, self.GREEN, self.RED)
+
+        def mark_done():
+            self._displaying = False
+
+        if self.config.presentation_mode == "demo":
+            self.root.after(self.ACTUAL_DELAY_MS, reveal_actual)
+            self.root.after(self.DISPLAY_INTERVAL_MS, mark_done)
+        else:
+            reveal_actual()
+            mark_done()
+
+    # ══════════════════════════════════════════════════════════════════
+    # Legacy Streaming Loop (FBCSP fallback, root.after driven)
     # ══════════════════════════════════════════════════════════════════
 
     _COUNTDOWN_TICK_MS = 50

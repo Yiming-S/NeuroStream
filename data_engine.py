@@ -109,29 +109,37 @@ class DataEngine:
         Returns
         -------
         X : np.ndarray
-            Shape (n_trials, n_channels, n_times)      for CSP / Riemannian
-            Shape (n_trials, n_channels, n_times, n_bands) for FBCSP
         y : np.ndarray  shape (n_trials,)
+        ea_matrix : np.ndarray or None
+            Frozen R^{-1/2} for online EA.  Only returned for Cross-Session
+            non-Riemannian non-FBCSP pipelines; None otherwise.
         """
         if self.config.evaluation_protocol == "Cross-Subject":
             return self._load_cross_subject_train()
         else:
             return self._load_cross_session_train()
 
-    def get_test_data(self):
+    def get_test_data(self, apply_ea: bool = True):
         """
         Load and return test epochs according to the evaluation protocol.
 
+        Parameters
+        ----------
+        apply_ea : bool
+            If True (legacy behaviour), apply EA to the test data.
+            Set to False for the online architecture path where EA is
+            handled per-epoch via the frozen training matrix.
+
         Returns
         -------
-        X     : np.ndarray  (same shape convention as get_train_data)
+        X     : np.ndarray
         y     : np.ndarray  shape (n_trials,)
         sfreq : float  sampling frequency in Hz
         """
         if self.config.evaluation_protocol == "Cross-Subject":
-            return self._load_cross_subject_test()
+            return self._load_cross_subject_test(apply_ea=apply_ea)
         else:
-            return self._load_cross_session_test()
+            return self._load_cross_session_test(apply_ea=apply_ea)
 
     # ──────────────────────────────────────────────────────────────────
     # Cross-Subject loading
@@ -149,15 +157,17 @@ class DataEngine:
         y_concat  = np.concatenate(y_all, axis=0)
         self._log_shape("Training", X_concat)
 
-        if not self._use_riemannian:
+        # Cross-Subject V1: EA only for FBCSP legacy path (train/test
+        # consistency — online CSP/TS paths disable EA entirely).
+        if not self._use_riemannian and self._use_filterbank:
             X_concat = self._apply_euclidean_alignment(X_concat)
-        return X_concat, y_concat
+        return X_concat, y_concat, None
 
-    def _load_cross_subject_test(self):
+    def _load_cross_subject_test(self, apply_ea: bool = True):
         subject_id = self.config.test_subject
         print(f"  [DataEngine] Cross-Subject  — loading test subject {subject_id} …")
         X, y, sfreq, _ = self._load_subject(subject_id)
-        if not self._use_riemannian:
+        if apply_ea and not self._use_riemannian:
             X = self._apply_euclidean_alignment(X)
         return X, y, sfreq
 
@@ -181,11 +191,13 @@ class DataEngine:
         y_concat  = np.concatenate(y_all, axis=0)
         self._log_shape("Training", X_concat)
 
+        ea_matrix = None
         if not self._use_riemannian:
-            X_concat = self._apply_euclidean_alignment(X_concat)
-        return X_concat, y_concat
+            X_concat, ea_matrix = self._apply_euclidean_alignment(
+                X_concat, return_matrix=True)
+        return X_concat, y_concat, ea_matrix
 
-    def _load_cross_session_test(self):
+    def _load_cross_session_test(self, apply_ea: bool = True):
         subject_id   = self.config.cross_session_subject
         session_index = self.config.test_session
         print(
@@ -193,7 +205,7 @@ class DataEngine:
             f"session {session_index} (test) …"
         )
         X, y, sfreq, _ = self._load_session(subject_id, session_index)
-        if not self._use_riemannian:
+        if apply_ea and not self._use_riemannian:
             X = self._apply_euclidean_alignment(X)
         return X, y, sfreq
 
@@ -240,25 +252,30 @@ class DataEngine:
     # Euclidean Alignment
     # ──────────────────────────────────────────────────────────────────
 
-    def _apply_euclidean_alignment(self, X: np.ndarray) -> np.ndarray:
+    def _apply_euclidean_alignment(self, X: np.ndarray,
+                                    return_matrix: bool = False):
         """
         Dispatch to the appropriate alignment function based on data dimensions.
 
         3-D input (n, C, T)      → align the whole batch as one set.
         4-D input (n, C, T, B)   → align each frequency band independently.
+                                    return_matrix is NOT supported for 4-D
+                                    (FBCSP never needs a frozen matrix in V1).
         """
         if X.ndim == 3:
-            return self._euclidean_alignment(X)
+            return self._euclidean_alignment(X, return_matrix=return_matrix)
         elif X.ndim == 4:
-            return np.stack(
-                [self._euclidean_alignment(X[..., band]) for band in range(X.shape[-1])],
+            aligned = np.stack(
+                [self._euclidean_alignment(X[..., band])
+                 for band in range(X.shape[-1])],
                 axis=-1,
             )
+            return aligned
         else:
             raise ValueError(f"Expected 3-D or 4-D input, got shape {X.shape}")
 
     @staticmethod
-    def _euclidean_alignment(X: np.ndarray) -> np.ndarray:
+    def _euclidean_alignment(X: np.ndarray, return_matrix: bool = False):
         """
         Euclidean Mean Alignment — He & Wu (2020).
 
@@ -268,16 +285,22 @@ class DataEngine:
 
         Centres the covariance distribution around the identity matrix,
         reducing cross-subject and cross-session covariance shift.
+
+        If return_matrix is True, returns (X_aligned, inverse_sqrt_matrix)
+        so the matrix can be frozen for online use.
         """
         n, channels, time_points = X.shape
         mean_covariance = np.mean([x @ x.T / time_points for x in X], axis=0)
 
         eigenvalues, eigenvectors = np.linalg.eigh(mean_covariance)
-        eigenvalues           = np.maximum(eigenvalues, 1e-10)   # numerical safety
+        eigenvalues           = np.maximum(eigenvalues, 1e-10)
         inverse_sqrt_matrix   = (
             eigenvectors @ np.diag(eigenvalues ** -0.5) @ eigenvectors.T
         )
-        return np.array([inverse_sqrt_matrix @ x for x in X])
+        X_aligned = np.array([inverse_sqrt_matrix @ x for x in X])
+        if return_matrix:
+            return X_aligned, inverse_sqrt_matrix
+        return X_aligned
 
     # ──────────────────────────────────────────────────────────────────
     # Utilities

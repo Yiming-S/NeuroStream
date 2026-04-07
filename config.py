@@ -74,6 +74,20 @@ class BCIConfig:
     # Session index used for streaming / testing
     test_session: int = 2
 
+    # ── Online architecture ─────────────────────────────────────────────
+
+    # "demo" — paced replay with ACTUAL_DELAY_MS / DISPLAY_INTERVAL_MS
+    # "live" — continuous processing, UI may skip display to keep up
+    presentation_mode: str = "demo"
+
+    # Ring buffer capacity (seconds).  Must be > several trial durations.
+    buffer_capacity_s: float = 30.0
+
+    # Inter-trial gap for replay source (seconds).
+    # In demo mode this must be >= ACTUAL_DELAY_MS + DISPLAY_INTERVAL_MS
+    # to avoid result-queue backlog.
+    replay_gap_s: float = 4.0
+
     # ── Data location ──────────────────────────────────────────────────
 
     # Directory where MNE/MOABB data lives (contains MNE-zhou-2016/ subfolder)

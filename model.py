@@ -53,6 +53,18 @@ class BCIModel:
         self.pipelines: dict[int, Pipeline] = {}
         self.is_trained: bool = False
         self._sample_points: list[int] = []
+        self._ea_matrix: Optional[np.ndarray] = None
+
+    # ------------------------------------------------------------------
+    def set_ea_matrix(self, matrix: Optional[np.ndarray]) -> None:
+        """Store the frozen EA matrix from training data (or None to disable)."""
+        self._ea_matrix = matrix
+
+    def apply_ea(self, epoch: np.ndarray) -> np.ndarray:
+        """Apply frozen EA to a single epoch (n_channels, n_times). No-op if None."""
+        if self._ea_matrix is None:
+            return epoch
+        return self._ea_matrix @ epoch
 
     # ------------------------------------------------------------------
     def build(self, sample_points: Optional[list[int]] = None) -> None:
